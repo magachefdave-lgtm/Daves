@@ -104,6 +104,32 @@ def test_share_path():
         core.share_path(eq(os="Linux"))
 
 
+def test_share_can_be_turned_off_per_equipment(store, tmp_path):
+    a = eq("EQ-01", share_enabled=False)
+    store.add(a)
+    store.add(eq("EQ-02", "10.0.0.2"))
+    loaded = {e.name: e for e in store.load()}
+    assert not core.has_share(loaded["EQ-01"]) and core.has_share(loaded["EQ-02"])
+    assert not core.has_share(eq(os="Linux"))
+    # 공유폴더사용 열이 없는 CSV로 고쳐도 꺼 둔 설정이 남는다
+    p = tmp_path / "in.csv"
+    p.write_text("설비명,IP\nEQ-01,10.0.0.9\n", encoding="utf-8")
+    store.import_csv(str(p))
+    assert store.load()[0].host == "10.0.0.9" and not store.load()[0].share_enabled
+    # 열이 있으면 그 값을 따른다 (내보내기 -> 가져오기 왕복 포함)
+    out = str(tmp_path / "out.csv")
+    core.export_csv(store.load(), out)
+    other = EquipmentStore(str(tmp_path / "other.json"))
+    other.import_csv(out)
+    assert [e.share_enabled for e in other.load()] == [False, True]
+
+
+def test_new_title():
+    assert core.new_title("ETCH-01", "desk - TightVNC Viewer") == "[ETCH-01] desk - TightVNC Viewer"
+    assert core.new_title("ETCH-01", "[ETCH-01] desk - TightVNC Viewer") is None
+    assert core.new_title("ETCH-1", "[ETCH-10] x") == "[ETCH-1] [ETCH-10] x"
+
+
 def test_build_command_per_viewer():
     e = eq(port=5901)
     cmd = lambda t, pw="": core.build_command(Config(viewer_type=t, viewer_path="v.exe"), e, pw)
@@ -187,7 +213,8 @@ def test_config_roundtrip_with_bom(tmp_path):
     p = str(tmp_path / "config.ini")
     cfg = Config(viewer_type="ultravnc", viewer_path=r"C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe",
                  extra_args="-fullscreen", equipment_file=r"\\서버\공유\equipment.json",
-                 check_on_start=False, check_timeout=2.5, custom_args="%h {host}")
+                 check_on_start=False, check_timeout=2.5, custom_args="%h {host}",
+                 show_share=False, title_with_name=False)
     core.save_config(cfg, p)
     assert core.load_config(p) == cfg
     raw = open(p, "rb").read()

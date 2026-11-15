@@ -17,7 +17,7 @@ OS_WINDOWS = "Windows"
 OS_CHOICES = (OS_WINDOWS, "Linux", "기타")
 DEFAULT_PORT = 5900
 
-CSV_COLUMNS = ("설비명", "그룹", "IP", "포트", "OS", "공유폴더", "메모")
+CSV_COLUMNS = ("설비명", "그룹", "IP", "포트", "OS", "공유폴더", "메모", "공유폴더사용")
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
 _SHARE_BAD = re.compile(r'[<>"|?*\x00-\x1f]')
@@ -43,6 +43,7 @@ class Equipment:
     os: str = OS_WINDOWS
     share: str = ""
     memo: str = ""
+    share_enabled: bool = True   # False = 이 설비에는 공유폴더 버튼을 보이지 않는다
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @classmethod
@@ -55,6 +56,7 @@ class Equipment:
             os=normalize_os(d.get("os", OS_WINDOWS)),
             share=str(d.get("share", "")).strip(),
             memo=str(d.get("memo", "")).strip(),
+            share_enabled=_to_bool(d.get("share_enabled", True)),
             id=str(d.get("id") or uuid.uuid4().hex),
         )
 
@@ -67,6 +69,24 @@ def _to_port(value) -> int:
         return int(float(text))  # 엑셀이 5900.0 으로 내보내는 경우
     except ValueError:
         return -1
+
+
+def _to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in (
+        "n", "no", "0", "false", "off", "x", "아니오", "아니요", "미사용", "사용안함", "숨김")
+
+
+def has_share(eq: "Equipment") -> bool:
+    """공유폴더 버튼을 쓸 수 있는 설비인지."""
+    return eq.os == OS_WINDOWS and eq.share_enabled
+
+
+def new_title(name: str, current: str) -> str | None:
+    """VNC 창 제목 앞에 설비명을 붙인 새 제목. 이미 붙어 있으면 None."""
+    prefix = f"[{name}] "
+    return None if current.startswith(prefix) else prefix + current
 
 
 def normalize_os(value) -> str:
@@ -273,6 +293,8 @@ class EquipmentStore:
             old = by_name.get(eq.name.casefold())
             if old:
                 eq.id = old.id
+                if "share_enabled" not in row:   # 열이 없는 CSV는 기존 설정을 지킨다
+                    eq.share_enabled = old.share_enabled
                 items[items.index(old)] = eq
                 updated += 1
             else:
@@ -294,6 +316,7 @@ _CSV_KEYS = {
     "os": "os", "운영체제": "os",
     "공유폴더": "share", "share": "share",
     "메모": "memo", "비고": "memo", "memo": "memo",
+    "공유폴더사용": "share_enabled", "공유폴더버튼": "share_enabled",
     "비밀번호": "password", "vnc비밀번호": "password", "암호": "password",
     "password": "password", "pw": "password",
 }
@@ -336,7 +359,8 @@ def export_csv(items: list[Equipment], csv_path: str) -> None:
             w = csv.writer(f)
             w.writerow(CSV_COLUMNS)
             for e in items:
-                w.writerow([e.name, e.group, e.host, e.port, e.os, e.share, e.memo])
+                w.writerow([e.name, e.group, e.host, e.port, e.os, e.share, e.memo,
+                            "Y" if e.share_enabled else "N"])
     except OSError as e:
         raise StoreError(
             f"CSV 파일을 저장할 수 없습니다.\n{csv_path}\n\n"
@@ -407,6 +431,8 @@ class Config:
     equipment_file: str = ""
     check_on_start: bool = True
     check_timeout: float = 1.5
+    show_share: bool = True        # 공유폴더 버튼을 화면에 보일지 (전체)
+    title_with_name: bool = True   # VNC 창 제목에 설비명을 붙일지
 
     def templates(self) -> tuple[str, str]:
         if self.viewer_type == "custom":
@@ -483,7 +509,9 @@ def load_config(path: str) -> Config:
     cfg.custom_args = g("viewer", "custom_args", cfg.custom_args)
     cfg.custom_pw_args = g("viewer", "custom_password_args", "")
     cfg.equipment_file = g("data", "equipment_file", "").strip('"')
-    cfg.check_on_start = g("status", "check_on_start", "yes").lower() in ("1", "yes", "true", "on", "y")
+    cfg.check_on_start = _to_bool(g("status", "check_on_start", "yes"))
+    cfg.show_share = _to_bool(g("ui", "show_share_button", "yes"))
+    cfg.title_with_name = _to_bool(g("viewer", "title_with_name", "yes"))
     try:
         cfg.check_timeout = min(10.0, max(0.3, float(g("status", "timeout_seconds", "1.5"))))
     except ValueError:
@@ -504,11 +532,17 @@ extra_args = {cfg.extra_args}
 ; type = custom 일 때만 쓰는 인자 형식. {{host}} {{port}} {{password}} 자리에 값이 들어갑니다.
 custom_args = {cfg.custom_args}
 custom_password_args = {cfg.custom_pw_args}
+; VNC 창의 제목 표시줄 앞에 [설비명] 을 붙일지 (yes / no)
+title_with_name = {"yes" if cfg.title_with_name else "no"}
 
 [data]
 ; 설비 목록 파일 위치. 비워 두면 프로그램 폴더의 equipment.json 을 씁니다.
 ; 여러 PC가 같은 목록을 쓰려면 공유 폴더 경로를 적습니다. 예: \\\\서버\\공유\\equipment.json
 equipment_file = {cfg.equipment_file}
+
+[ui]
+; 설비 버튼에 공유폴더 아이콘을 보일지 (yes / no). no 로 하면 모든 설비에서 사라집니다.
+show_share_button = {"yes" if cfg.show_share else "no"}
 
 [status]
 ; 프로그램을 켤 때 각 설비의 VNC 포트 응답을 확인할지 (yes / no)

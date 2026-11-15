@@ -11,10 +11,10 @@ import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from . import APP_NAME, APP_VERSION, secret
+from . import APP_NAME, APP_VERSION, secret, wintitle
 from .core import (OS_CHOICES, OS_WINDOWS, VIEWERS, Config, Equipment,
                    EquipmentStore, StoreError, app_dir, build_command,
-                   detect_viewer, equipment_file, export_csv, is_reachable,
+                   detect_viewer, equipment_file, export_csv, has_share, is_reachable,
                    load_config, natural_key, save_config, share_path)
 
 ALL_GROUPS = "전체"
@@ -29,6 +29,7 @@ TEXT = "#18212c"
 SUB = "#6a7686"
 ACCENT = "#2563eb"
 ACCENT_DARK = "#1d4fd7"
+ACTIVE_BG = "#e3edff"
 SOFT = "#e9eef5"
 SOFT_HOVER = "#dbe4f0"
 UP = "#16a34a"
@@ -42,10 +43,10 @@ TILE_W_WIDE, TILE_W_NARROW, TILE_H, GAP, PAD, GROUP_GAP = 176, 118, 36, 6, 16, 1
 HINT = "클릭 = VNC 접속   ·   폴더 아이콘 = 공유폴더   ·   오른쪽 클릭 = 수정 / 삭제 / 그룹 이동"
 
 
-def launch(cmd: list[str]) -> None:
+def launch(cmd: list[str]) -> subprocess.Popen:
     # 콘솔 없는 exe에서는 표준 핸들이 유효하지 않아 넘겨주지 않으면 WinError 6이 난다.
-    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, close_fds=True)
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, close_fds=True)
 
 
 def round_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
@@ -86,7 +87,8 @@ class App:
         self.group = ALL_GROUPS
         self.hover = (None, None)   # (설비 id, 영역)
         self.pressed = (None, None)
-        self.menu_target: Equipment | None = None
+        self.sessions: list[tuple[str, str, subprocess.Popen]] = []  # 떠 있는 뷰어 (설비 id, 설비명, 프로세스)
+        self.base: dict[str, tuple] = {}   # 설비 버튼의 평소 색 (마우스가 떠날 때 되돌린다)
         self.pool = ThreadPoolExecutor(max_workers=16)
         self.results: queue.Queue = queue.Queue()
         self.pending = 0
@@ -115,11 +117,13 @@ class App:
             self._save_config()
         self.passwords = secret.PasswordStore(os.path.join(app_dir(), "passwords.json"))
         self._open_store()
+        self._show_sessions()
         self.reload()
         if self.cfg.check_on_start:
             self.check_status()
         self.root.after(300, self._poll_results)
         self.root.after(5000, self._watch_file)
+        self.root.after(1000, self._tick_sessions)
 
     # ------------------------------------------------------------ 화면 ---
 
@@ -178,8 +182,13 @@ class App:
         self.summary = tk.Label(row1, font=self.f_small, bg=CARD, fg=SUB)
         self.summary.pack(side="left")
 
-        self.chips = tk.Canvas(head, bg=CARD, height=28, highlightthickness=0)
-        self.chips.pack(fill="x", padx=PAD, pady=(0, 8))
+        row2 = tk.Frame(head, bg=CARD)
+        row2.pack(fill="x", padx=PAD, pady=(0, 8))
+        # 오른쪽 위: 지금 VNC로 접속해 있는 설비
+        self.active_lbl = tk.Label(row2, font=self.f_small, padx=10, pady=4, anchor="e")
+        self.active_lbl.pack(side="right", anchor="n", padx=(12, 0))
+        self.chips = tk.Canvas(row2, bg=CARD, height=28, highlightthickness=0)
+        self.chips.pack(side="left", fill="x", expand=True)
         self.chips.bind("<Configure>", lambda _e: self._draw_chips())
         self.chips.bind("<Button-1>", self._on_chip)
 
@@ -305,6 +314,7 @@ class App:
         c = self.canvas
         c.delete("all")
         self.hover = (None, None)
+        self.base = {}
         width, height = max(c.winfo_width(), 300), max(c.winfo_height(), 100)
         shown = self.visible()
         up = sum(1 for e in self.items if self.status.get(e.id) is True)
@@ -375,17 +385,23 @@ class App:
             self.scroll.pack_forget()
             self.canvas.yview_moveto(0)
 
+    def _share_on(self, e: Equipment) -> bool:
+        return self.cfg.show_share and has_share(e)
+
     def _tile(self, e: Equipment, x: float, y: float, w: float):
         c = self.canvas
         st = self.status.get(e.id)
         tid = f"id:{e.id}"
         body = (tid, "zone:body")
         mid = y + TILE_H / 2
-        round_rect(c, x, y, x + w, y + TILE_H, 10, fill=CARD, outline=BORDER, width=1,
+        active = any(s[0] == e.id for s in self.sessions)   # 지금 접속 중인 설비는 파랗게
+        self.base[e.id] = (ACTIVE_BG, ACCENT, 2) if active else (CARD, BORDER, 1)
+        fill, outline, line = self.base[e.id]
+        round_rect(c, x, y, x + w, y + TILE_H, 10, fill=fill, outline=outline, width=line,
                    tags=body + (f"card:{e.id}",))
         c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=STATUS_COLOR.get(st, IDLE), outline="", tags=body)
         right = x + w - 8
-        if e.os == OS_WINDOWS:   # 공유폴더 버튼 (폴더 아이콘)
+        if self._share_on(e):   # 공유폴더 버튼 (폴더 아이콘)
             share = (tid, "zone:share")
             round_rect(c, right - 26, mid - 12, right, mid + 12, 7, fill=SOFT, outline="",
                        tags=share + (f"btn:{e.id}",))
@@ -418,7 +434,8 @@ class App:
             return
         c = self.canvas
         if old[0]:
-            c.itemconfigure(f"card:{old[0]}", fill=CARD, outline=BORDER, width=1)
+            fill, outline, line = self.base.get(old[0], (CARD, BORDER, 1))
+            c.itemconfigure(f"card:{old[0]}", fill=fill, outline=outline, width=line)
             c.itemconfigure(f"btn:{old[0]}", fill=SOFT)
             c.itemconfigure(f"ico:{old[0]}", fill=SUB)
         if new[0]:
@@ -466,7 +483,7 @@ class App:
         m.delete(0, "end")
         mv.delete(0, "end")
         m.add_command(label=f"{eq.name}  VNC 접속", command=lambda: self.connect(eq))
-        if eq.os == OS_WINDOWS:
+        if self._share_on(eq):
             m.add_command(label="공유폴더 열기", command=lambda: self.open_share(eq))
         m.add_command(label="IP 복사", command=lambda: self.copy_ip(eq))
         m.add_separator()
@@ -478,6 +495,9 @@ class App:
         mv.add_separator()
         mv.add_command(label="    새 그룹 만들기…", command=lambda: self.move_to_new(eq))
         m.add_cascade(label="그룹 이동", menu=mv)
+        if eq.os == OS_WINDOWS and self.cfg.show_share:
+            m.add_command(label="공유폴더 버튼 숨기기" if eq.share_enabled else "공유폴더 버튼 보이기",
+                          command=lambda: self.toggle_share(eq))
         m.add_command(label="수정", command=lambda: self.edit(eq))
         m.add_command(label="삭제", command=lambda: self.delete(eq))
         m.tk_popup(event.x_root, event.y_root)
@@ -538,7 +558,7 @@ class App:
             return
         try:
             pw = self.passwords.get(eq.id) if secret.AVAILABLE else ""
-            launch(build_command(self.cfg, eq, pw))
+            proc = launch(build_command(self.cfg, eq, pw))
         except StoreError as e:
             messagebox.showwarning(APP_NAME, str(e))
         except OSError as e:
@@ -548,10 +568,46 @@ class App:
                 "[더보기 > 설정]에서 뷰어 실행 파일 경로가 맞는지 확인하세요.\n"
                 f"({e})"))
         else:
+            self.sessions.append((eq.id, eq.name, proc))
+            self._show_sessions()
+            self.draw()
             self.toast(f"{eq.name} ({eq.host}) VNC 접속을 시작했습니다.")
 
+    def _tick_sessions(self):
+        """뷰어 창이 닫혔는지 살피고, 떠 있는 뷰어 창 제목에 설비명을 붙인다."""
+        alive = [s for s in self.sessions if s[2].poll() is None]
+        if len(alive) != len(self.sessions):
+            self.sessions = alive
+            self._show_sessions()
+            self.draw()
+        if self.cfg.title_with_name:
+            for _eq_id, name, proc in alive:
+                try:
+                    wintitle.retitle(proc.pid, name)
+                except Exception:   # 제목을 못 바꿔도 접속에는 지장이 없다
+                    pass
+        self.root.after(1000, self._tick_sessions)
+
+    def _show_sessions(self):
+        names = list(dict.fromkeys(s[1] for s in self.sessions))
+        if not names:
+            self.active_lbl.configure(text="접속 중인 설비 없음", bg=CARD, fg=SUB, font=self.f_small)
+            return
+        text = ",  ".join(names[:3]) + (f"  외 {len(names) - 3}대" if len(names) > 3 else "")
+        self.active_lbl.configure(text=f"●  접속 중:  {text}", bg=ACTIVE_BG, fg=ACCENT, font=self.f_group)
+
+    def toggle_share(self, eq: Equipment):
+        eq.share_enabled = not eq.share_enabled
+        try:
+            self.store.update(eq)
+        except StoreError as e:
+            messagebox.showwarning(APP_NAME, str(e))
+        else:
+            self.toast(f"{eq.name} 공유폴더 버튼을 {'보이게' if eq.share_enabled else '숨기게'} 했습니다.")
+        self.reload()
+
     def open_share(self, eq: Equipment | None):
-        if not eq or eq.os != OS_WINDOWS:
+        if not eq or not self._share_on(eq):
             return
         path = share_path(eq)
         if sys.platform != "win32":
@@ -813,6 +869,7 @@ class EquipmentDialog(_Dialog):
         self.os = tk.StringVar(value=eq.os)
         self.share = tk.StringVar(value=eq.share)
         self.memo = tk.StringVar(value=eq.memo)
+        self.share_on = tk.BooleanVar(value=eq.share_enabled)
         self.pw = tk.StringVar()
         self.pw_clear = tk.BooleanVar(value=False)
 
@@ -827,6 +884,9 @@ class EquipmentDialog(_Dialog):
         self.share_entry = ttk.Entry(b, textvariable=self.share)
         self.field("공유폴더", self.share_entry,
                    "예: D$ 또는 Data  (비우면 \\\\IP 의 공유 목록 전체)")
+        self.share_check = ttk.Checkbutton(b, text="이 설비에 공유폴더 버튼 보이기", variable=self.share_on,
+                                           command=self._sync)
+        self.field("", self.share_check)
         self.field("메모", ttk.Entry(b, textvariable=self.memo))
         if secret.AVAILABLE:
             if not pw_supported:
@@ -846,14 +906,17 @@ class EquipmentDialog(_Dialog):
         first.focus_set()
 
     def _sync(self):
-        self.share_entry["state"] = "normal" if self.os.get() == OS_WINDOWS else "disabled"
+        is_win = self.os.get() == OS_WINDOWS
+        self.share_check["state"] = "normal" if is_win else "disabled"
+        self.share_entry["state"] = "normal" if is_win and self.share_on.get() else "disabled"
 
     def submit(self):
         is_win = self.os.get() == OS_WINDOWS
         new = Equipment.from_dict({
             "id": self.eq.id, "name": self.name.get(), "group": self.group.get(),
             "host": self.host.get(), "port": self.port.get() or "5900", "os": self.os.get(),
-            "share": self.share.get() if is_win else "", "memo": self.memo.get()})
+            "share": self.share.get() if is_win else "", "memo": self.memo.get(),
+            "share_enabled": self.share_on.get()})
         password = None  # None = 건드리지 않음
         if self.pw_clear.get():
             password = ""
@@ -876,6 +939,8 @@ class SettingsDialog(_Dialog):
         self.cpw = tk.StringVar(value=cfg.custom_pw_args)
         self.efile = tk.StringVar(value=cfg.equipment_file)
         self.check = tk.BooleanVar(value=cfg.check_on_start)
+        self.show_share = tk.BooleanVar(value=cfg.show_share)
+        self.title_name = tk.BooleanVar(value=cfg.title_with_name)
 
         box = ttk.Combobox(b, textvariable=self.vtype, state="readonly",
                            values=[VIEWERS[k]["label"] for k in self.keys])
@@ -896,6 +961,9 @@ class SettingsDialog(_Dialog):
         self.field("설비 목록 파일", row2,
                    "비우면 프로그램 폴더의 equipment.json. 공유 폴더 경로를 넣으면 여러 PC가 같이 씁니다")
         self.field("", ttk.Checkbutton(b, text="프로그램을 켤 때 설비 상태 확인", variable=self.check))
+        self.field("", ttk.Checkbutton(b, text="VNC 창 제목 표시줄에 설비명 표시", variable=self.title_name))
+        self.field("", ttk.Checkbutton(b, text="공유폴더 버튼 사용", variable=self.show_share),
+                   "끄면 모든 설비에서 사라집니다. 설비별로 끄려면 설비를 오른쪽 클릭하세요")
         box.bind("<<ComboboxSelected>>", lambda _e: self._sync())
         self._sync()
         self.buttons()
@@ -952,7 +1020,8 @@ class SettingsDialog(_Dialog):
             custom_args=self.cargs.get().strip() if key == "custom" else self.cfg.custom_args,
             custom_pw_args=self.cpw.get().strip() if key == "custom" else self.cfg.custom_pw_args,
             equipment_file=self.efile.get().strip().strip('"'),
-            check_on_start=self.check.get(), check_timeout=self.cfg.check_timeout)
+            check_on_start=self.check.get(), check_timeout=self.cfg.check_timeout,
+            show_share=self.show_share.get(), title_with_name=self.title_name.get())
         if self.on_save and self.on_save(cfg):
             self.top.destroy()
 
