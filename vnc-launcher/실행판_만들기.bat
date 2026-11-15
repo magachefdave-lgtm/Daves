@@ -19,6 +19,7 @@ if errorlevel 1 goto fail
 
 copy /y "시작하기.txt" dist\ >nul
 copy /y "설비목록_예시.csv" dist\ >nul
+copy /y "비밀번호_예시.csv" dist\ >nul
 if not exist "dist\시작하기.txt" goto fail
 
 echo.

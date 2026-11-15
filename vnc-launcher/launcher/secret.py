@@ -75,6 +75,12 @@ class PasswordStore:
             return
         self._save(data)
 
+    def set_many(self, passwords: dict) -> None:
+        data = self._load()
+        for eq_id, password in passwords.items():
+            data[eq_id] = base64.b64encode(self._enc(password.encode("utf-8"))).decode("ascii")
+        self._save(data)
+
     def delete(self, ids) -> None:
         data = self._load()
         kept = {k: v for k, v in data.items() if k not in set(ids)}

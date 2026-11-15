@@ -224,7 +224,7 @@ class App:
         self.menu.add_command(label="수정", command=lambda: self.edit(self.menu_target))
         self.menu.add_command(label="삭제", command=lambda: self.delete(self.menu_target))
         self.more_menu = tk.Menu(root, **menu_opts)
-        self.more_menu.add_command(label="CSV 가져오기", command=self.import_csv)
+        self.more_menu.add_command(label="CSV 가져오기 (설비 · 비밀번호)", command=self.import_csv)
         self.more_menu.add_command(label="CSV 내보내기", command=self.export_csv)
         self.more_menu.add_separator()
         self.more_menu.add_command(label="설정", command=self.open_settings)
@@ -584,18 +584,34 @@ class App:
         if not path:
             return
         try:
-            added, updated, problems = self.store.import_csv(path)
+            added, updated, problems, passwords = self.store.import_csv(path)
         except StoreError as e:
             messagebox.showerror(APP_NAME, str(e))
             return
         self.reload()
-        msg = f"추가 {added}대, 수정 {updated}대"
+        msg = f"설비 추가 {added}대, 수정 {updated}대"
+        if passwords:
+            msg += "\n" + self._remember_passwords(passwords)
         if problems:
             msg += f"\n\n건너뛴 줄 {len(problems)}개:\n" + "\n".join(problems[:10])
             if len(problems) > 10:
                 msg += "\n..."
         (messagebox.showwarning if problems else messagebox.showinfo)(APP_NAME, msg)
         self.check_status()
+
+    def _remember_passwords(self, passwords: dict) -> str:
+        if not secret.AVAILABLE:
+            return "비밀번호 저장은 Windows에서만 됩니다."
+        try:
+            self.passwords.set_many(passwords)
+        except OSError as e:
+            return f"비밀번호를 저장하지 못했습니다. 프로그램 폴더의 쓰기 권한을 확인하세요.\n({e})"
+        text = (f"비밀번호 저장 {len(passwords)}대 - 이 PC에 암호화해 기억했으므로 "
+                "다시 가져올 필요가 없습니다.\n\n"
+                "가져온 파일에는 비밀번호가 그대로 적혀 있으니 안전한 곳에 두거나 지우세요.")
+        if not self.cfg.supports_password():
+            text += "\n\n지금 설정된 뷰어는 비밀번호 자동 입력을 지원하지 않아, 접속할 때 뷰어가 직접 묻습니다."
+        return text
 
     def export_csv(self):
         path = filedialog.asksaveasfilename(title="CSV 내보내기", defaultextension=".csv",

@@ -192,14 +192,29 @@ class EquipmentStore:
             self._write(kept)
         return len(items) - len(kept)
 
-    def import_csv(self, csv_path: str) -> tuple[int, int, list[str]]:
-        """설비명이 같으면 고치고 없으면 추가한다. (추가 수, 수정 수, 건너뛴 줄 설명)"""
-        rows = read_csv(csv_path)
+    def import_csv(self, csv_path: str) -> tuple[int, int, list[str], dict[str, str]]:
+        """설비명이 같으면 고치고 없으면 추가한다.
+
+        (추가 수, 수정 수, 건너뛴 줄 설명, {설비 id: 비밀번호})
+        비밀번호는 목록 파일에 넣지 않고 돌려주기만 한다 - 보관은 PasswordStore 몫.
+        IP 열 없이 '설비명,비밀번호'만 있는 파일은 이미 등록된 설비에 비밀번호만 붙인다.
+        """
+        rows, has_host = read_csv(csv_path)
         items = self.load()
         by_name = {e.name.casefold(): e for e in items}
         added = updated = 0
         problems = []
+        passwords: dict[str, str] = {}
         for line_no, row in rows:
+            password = row.pop("password", "").strip()
+            if not has_host:
+                name = row.get("name", "").strip()
+                old = by_name.get(name.casefold())
+                if not old:
+                    problems.append(f"{line_no}번째 줄 ({name or '이름 없음'}): 등록되지 않은 설비명입니다.")
+                elif password:
+                    passwords[old.id] = password
+                continue
             eq = Equipment.from_dict(row)
             errors = validate(eq)
             if errors:
@@ -214,9 +229,11 @@ class EquipmentStore:
                 items.append(eq)
                 added += 1
             by_name[eq.name.casefold()] = eq
+            if password:
+                passwords[eq.id] = password
         if added or updated:
             self._write(items)
-        return added, updated, problems
+        return added, updated, problems, passwords
 
 
 _CSV_KEYS = {
@@ -227,11 +244,13 @@ _CSV_KEYS = {
     "os": "os", "운영체제": "os",
     "공유폴더": "share", "share": "share",
     "메모": "memo", "비고": "memo", "memo": "memo",
+    "비밀번호": "password", "vnc비밀번호": "password", "암호": "password",
+    "password": "password", "pw": "password",
 }
 
 
-def read_csv(csv_path: str) -> list[tuple[int, dict]]:
-    """엑셀이 저장한 CSV(CP949)와 UTF-8 둘 다 읽는다. [(줄 번호, 행)]"""
+def read_csv(csv_path: str) -> tuple[list[tuple[int, dict]], bool]:
+    """엑셀이 저장한 CSV(CP949)와 UTF-8 둘 다 읽는다. ([(줄 번호, 행)], IP 열이 있는지)"""
     try:
         with open(csv_path, "rb") as f:
             raw = f.read()
@@ -246,17 +265,18 @@ def read_csv(csv_path: str) -> list[tuple[int, dict]]:
     if header is None:
         raise StoreError("CSV 파일이 비어 있습니다.")
     keys = [_CSV_KEYS.get(h.strip().replace(" ", "").lower()) for h in header]
-    if "name" not in keys or "host" not in keys:
+    if "name" not in keys or ("host" not in keys and "password" not in keys):
         raise StoreError(
             "CSV 첫 줄에 '설비명'과 'IP' 열이 있어야 합니다.\n"
-            "첫 줄 예: " + ",".join(CSV_COLUMNS)
+            "첫 줄 예: " + ",".join(CSV_COLUMNS) + ",비밀번호\n\n"
+            "비밀번호만 넣으려면 첫 줄을 '설비명,비밀번호'로 합니다."
         )
     rows = []
     for line_no, cells in enumerate(reader, start=2):
         if not any(c.strip() for c in cells):
             continue
         rows.append((line_no, {k: c for k, c in zip(keys, cells) if k}))
-    return rows
+    return rows, "host" in keys
 
 
 def export_csv(items: list[Equipment], csv_path: str) -> None:

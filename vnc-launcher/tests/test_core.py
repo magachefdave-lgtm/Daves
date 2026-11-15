@@ -102,8 +102,8 @@ def test_csv_import_cp949_and_merge(store, tmp_path):
                   "EQ-02,2라인,10.0.0.12,,리눅스,,\r\n"
                   ",,,,,,\r\n"
                   "EQ-03,2라인,,5900,Windows,,\r\n".encode("cp949"))
-    added, updated, problems = store.import_csv(str(p))
-    assert (added, updated) == (1, 1)
+    added, updated, problems, passwords = store.import_csv(str(p))
+    assert (added, updated) == (1, 1) and passwords == {}
     assert len(problems) == 1 and "5번째 줄" in problems[0]
     items = {e.name: e for e in store.load()}
     assert (items["EQ-01"].host, items["EQ-01"].share, items["EQ-01"].port) == ("10.0.0.11", "D$", 5900)
@@ -119,6 +119,31 @@ def test_csv_export_import_roundtrip(store, tmp_path):
     store.import_csv(p)
     strip = lambda e: (e.name, e.group, e.host, e.port, e.os, e.share, e.memo)
     assert [strip(e) for e in store.load()] == [strip(e) for e in src]
+
+
+def test_csv_with_password_column(store, tmp_path):
+    old = eq("EQ-01", "10.0.0.1")
+    store.add(old)
+    p = tmp_path / "in.csv"
+    p.write_bytes("설비명,IP,비밀번호\r\nEQ-01,10.0.0.1,aaa\r\nEQ-02,10.0.0.2, b b \r\n"
+                  "EQ-03,10.0.0.3,\r\nEQ-04,,zzz\r\n".encode("cp949"))
+    added, updated, problems, passwords = store.import_csv(str(p))
+    ids = {e.name: e.id for e in store.load()}
+    assert (added, updated, len(problems)) == (2, 1, 1)
+    assert passwords == {old.id: "aaa", ids["EQ-02"]: "b b"}   # 빈칸 = 건드리지 않음, 오류 줄 제외
+    assert "aaa" not in open(store.path, encoding="utf-8").read()  # 목록 파일에는 넣지 않는다
+
+
+def test_csv_password_only_file(store, tmp_path):
+    a, b = eq("EQ-01", "10.0.0.1", memo="유지"), eq("EQ-02", "10.0.0.2")
+    store.add(a)
+    store.add(b)
+    p = tmp_path / "pw.csv"
+    p.write_text("설비명,비밀번호\neq-01,p1\nEQ-02,\n없는설비,p3\n", encoding="utf-8-sig")
+    added, updated, problems, passwords = store.import_csv(str(p))
+    assert (added, updated) == (0, 0) and passwords == {a.id: "p1"}
+    assert len(problems) == 1 and "없는설비" in problems[0]
+    assert [(e.name, e.host, e.memo) for e in store.load()] == [("EQ-01", "10.0.0.1", "유지"), ("EQ-02", "10.0.0.2", "")]
 
 
 def test_csv_missing_columns(store, tmp_path):
@@ -147,6 +172,8 @@ def test_password_store(tmp_path):
     ps.set("b", "x")
     assert ps.get("a") == "비번 1" and ps.has("b")
     assert "비번" not in open(ps.path, encoding="utf-8").read()
+    ps.set_many({"b": "y", "c": "z"})
+    assert (ps.get("a"), ps.get("b"), ps.get("c")) == ("비번 1", "y", "z")
     ps.set("a", "")
     ps.delete(["b"])
     assert ps.get("a") == "" and not ps.has("b")
