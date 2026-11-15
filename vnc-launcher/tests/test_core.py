@@ -37,6 +37,36 @@ def test_two_pcs_do_not_overwrite_each_other(store):
     assert {e.name for e in store.load()} == {"EQ-A", "EQ-B"}
 
 
+def test_groups_order_and_empty_groups_persist(store):
+    a, b, c = eq("A", group="2라인"), eq("B", "10.0.0.2", group="10라인"), eq("C", "10.0.0.3")
+    for e in (a, b, c):
+        store.add(e)
+    assert store.groups == ["2라인", "10라인"]           # 처음에는 숫자 순
+    store.apply_groups(["10라인", "빈 그룹", "2라인"], {})
+    fresh = EquipmentStore(store.path)
+    fresh.load()
+    assert fresh.groups == ["10라인", "빈 그룹", "2라인"]  # 순서와 빈 그룹이 남는다
+    fresh.add(eq("D", "10.0.0.4", group="새 라인"))        # 다른 동작이 순서를 지우지 않는다
+    assert EquipmentStore(store.path).load() and fresh.groups == ["10라인", "빈 그룹", "2라인", "새 라인"]
+
+
+def test_move_and_apply_groups(store):
+    a, b, c = eq("A", group="G1"), eq("B", "10.0.0.2", group="G1"), eq("C", "10.0.0.3", group="G2")
+    for e in (a, b, c):
+        store.add(e)
+    assert store.move([a.id, c.id], "G3") == 2
+    assert {e.name: e.group for e in store.load()} == {"A": "G3", "B": "G1", "C": "G3"}
+    assert store.groups == ["G1", "G2", "G3"]
+    late = eq("D", "10.0.0.4", group="G2")       # 그룹 관리 화면을 연 뒤 다른 PC가 추가
+    # G1 -> 라인1 이름 변경, G3 삭제(C는 그룹 없음으로), A는 라인1로
+    other = EquipmentStore(store.path)
+    other.add(late)
+    store.apply_groups(["라인1", "G2"], {a.id: "라인1", b.id: "라인1", c.id: "G3"})
+    assert {e.name: e.group for e in store.load()} == {"A": "라인1", "B": "라인1", "C": "", "D": "G2"}
+    assert store.groups == ["라인1", "G2"]
+    assert store.move([a.id], "") == 1 and store.load()[0].group == ""
+
+
 def test_duplicate_name_rejected(store):
     store.add(eq())
     with pytest.raises(StoreError, match="같은 설비명"):

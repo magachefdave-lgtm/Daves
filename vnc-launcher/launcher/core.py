@@ -23,6 +23,11 @@ _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
 _SHARE_BAD = re.compile(r'[<>"|?*\x00-\x1f]')
 
 
+def natural_key(text: str):
+    """EQ-2 가 EQ-10 앞에 오도록 숫자를 숫자로 비교한다."""
+    return [(0, int(p)) if p.isdigit() else (1, p.casefold()) for p in re.split(r"(\d+)", text)]
+
+
 class StoreError(Exception):
     """사용자에게 그대로 보여 줄 수 있는 문장을 담는다."""
 
@@ -113,6 +118,18 @@ class EquipmentStore:
 
     def __init__(self, path: str):
         self.path = path
+        self.groups: list[str] = []  # 화면에 보일 그룹 순서 (설비가 없는 빈 그룹 포함)
+
+    @staticmethod
+    def _merge_groups(stored, items: list[Equipment]) -> list[str]:
+        """저장된 순서를 지키고, 목록에 없는데 설비가 쓰는 그룹은 뒤에 붙인다."""
+        out: list[str] = []
+        for g in stored:
+            g = str(g).strip()
+            if g and g not in out:
+                out.append(g)
+        extra = {e.group for e in items if e.group} - set(out)
+        return out + sorted(extra, key=natural_key)
 
     def mtime(self) -> float:
         try:
@@ -122,11 +139,14 @@ class EquipmentStore:
 
     def load(self) -> list[Equipment]:
         if not os.path.exists(self.path):
+            self.groups = []
             return []
         try:
             with open(self.path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
-            return [Equipment.from_dict(d) for d in data["equipment"]]
+            items = [Equipment.from_dict(d) for d in data["equipment"]]
+            self.groups = self._merge_groups(data.get("groups") or [], items)
+            return items
         except OSError as e:
             raise StoreError(
                 f"설비 목록 파일을 읽을 수 없습니다.\n{self.path}\n\n"
@@ -139,7 +159,8 @@ class EquipmentStore:
                 f"바꾸면 직전 상태로 되돌릴 수 있습니다.\n({e})"
             ) from e
 
-    def _write(self, items: list[Equipment]) -> None:
+    def _write(self, items: list[Equipment], groups=None) -> None:
+        groups = self._merge_groups(self.groups if groups is None else groups, items)
         folder = os.path.dirname(os.path.abspath(self.path))
         tmp = self.path + ".tmp"
         try:
@@ -147,11 +168,13 @@ class EquipmentStore:
             if os.path.exists(self.path):
                 shutil.copy2(self.path, self.path + ".bak")
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "equipment": [asdict(e) for e in items]},
+                json.dump({"version": 1, "groups": groups,
+                           "equipment": [asdict(e) for e in items]},
                           f, ensure_ascii=False, indent=1)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
+            self.groups = groups
         except OSError as e:
             raise StoreError(
                 f"설비 목록 파일에 저장할 수 없습니다.\n{self.path}\n\n"
@@ -183,6 +206,33 @@ class EquipmentStore:
         else:
             raise StoreError("다른 PC에서 이미 삭제된 설비입니다. 목록을 새로 고쳤습니다.")
         self._write(items)
+
+    def move(self, ids, group: str) -> int:
+        """설비를 다른 그룹으로 옮긴다. 없는 그룹이면 새로 만든다. ("" = 그룹 없음)"""
+        ids, group = set(ids), group.strip()
+        items = self.load()
+        moved = 0
+        for e in items:
+            if e.id in ids and e.group != group:
+                e.group = group
+                moved += 1
+        if moved or (group and group not in self.groups):
+            self._write(items, self.groups + [group])
+        return moved
+
+    def apply_groups(self, groups: list[str], assign: dict[str, str]) -> None:
+        """그룹 관리 화면의 결과를 저장한다.
+
+        groups: 그룹 이름과 순서, assign: {설비 id: 그룹}. assign 에 없는 설비
+        (그 사이 다른 PC가 추가한 것)는 건드리지 않는다.
+        """
+        groups = self._merge_groups(groups, [])
+        items = self.load()
+        for e in items:
+            if e.id in assign:
+                g = assign[e.id].strip()
+                e.group = g if g in groups else ""
+        self._write(items, groups)
 
     def delete(self, ids) -> int:
         ids = set(ids)
