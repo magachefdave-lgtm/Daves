@@ -373,6 +373,7 @@ def export_csv(items: list[Equipment], csv_path: str) -> None:
 _PF = (r"C:\Program Files", r"C:\Program Files (x86)")
 
 # args: 접속 인자, pw: 비밀번호를 저장해 둔 설비에만 덧붙이는 인자("" = 명령줄 전달 불가)
+# quiet: 접속 도중 뜨는 "연결 중" 상태창을 끄는 인자 (그런 창과 옵션이 있는 뷰어만)
 VIEWERS = {
     "tightvnc": {
         "label": "TightVNC",
@@ -384,6 +385,7 @@ VIEWERS = {
         "label": "UltraVNC",
         "args": "-connect {host}::{port}",
         "pw": "-password {password}",
+        "quiet": "-nostatus",
         "paths": [p + r"\uvnc bvba\UltraVNC\vncviewer.exe" for p in _PF],
     },
     "realvnc": {
@@ -433,6 +435,12 @@ class Config:
     check_timeout: float = 1.5
     show_share: bool = True        # 공유폴더 버튼을 화면에 보일지 (전체)
     title_with_name: bool = True   # VNC 창 제목에 설비명을 붙일지
+    quiet_connect: bool = True     # 접속 도중 뜨는 상태창을 숨길지
+
+    def quiet_args(self) -> list[str]:
+        if not self.quiet_connect or self.viewer_type == "custom":
+            return []
+        return VIEWERS.get(self.viewer_type, {}).get("quiet", "").split()
 
     def templates(self) -> tuple[str, str]:
         if self.viewer_type == "custom":
@@ -459,7 +467,7 @@ def build_command(cfg: Config, eq: Equipment, password: str = "") -> list[str]:
     cmd = [cfg.viewer_path] + _fill(args, values)
     if password and pw.strip():
         cmd += _fill(pw, {**values, "password": password})
-    return cmd + cfg.extra_args.split()
+    return cmd + cfg.quiet_args() + cfg.extra_args.split()
 
 
 def is_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
@@ -512,6 +520,7 @@ def load_config(path: str) -> Config:
     cfg.check_on_start = _to_bool(g("status", "check_on_start", "yes"))
     cfg.show_share = _to_bool(g("ui", "show_share_button", "yes"))
     cfg.title_with_name = _to_bool(g("viewer", "title_with_name", "yes"))
+    cfg.quiet_connect = _to_bool(g("viewer", "quiet_connect", "yes"))
     try:
         cfg.check_timeout = min(10.0, max(0.3, float(g("status", "timeout_seconds", "1.5"))))
     except ValueError:
@@ -534,6 +543,8 @@ custom_args = {cfg.custom_args}
 custom_password_args = {cfg.custom_pw_args}
 ; VNC 창의 제목 표시줄 앞에 [설비명] 을 붙일지 (yes / no)
 title_with_name = {"yes" if cfg.title_with_name else "no"}
+; 접속 도중 뜨는 "연결 중" 상태창을 숨길지 (yes / no). UltraVNC 에 적용됩니다.
+quiet_connect = {"yes" if cfg.quiet_connect else "no"}
 
 [data]
 ; 설비 목록 파일 위치. 비워 두면 프로그램 폴더의 equipment.json 을 씁니다.

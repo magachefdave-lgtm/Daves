@@ -783,7 +783,11 @@ class App:
             self.sessions.append((eq.id, eq.name, proc))
             self._show_sessions()
             self.draw()
-            self.toast(f"{eq.name} ({eq.host}) VNC 접속을 시작했습니다.")
+            if secret.AVAILABLE and self.cfg.supports_password() and not pw:
+                self.toast(f"{eq.name}: 저장된 비밀번호가 없어 뷰어가 비밀번호를 묻습니다. "
+                           "(오른쪽 클릭 > 수정, 또는 CSV 가져오기로 저장)")
+            else:
+                self.toast(f"{eq.name} ({eq.host}) VNC 접속을 시작했습니다.")
 
     def _tick_sessions(self):
         """뷰어 창이 닫혔는지 살피고, 떠 있는 뷰어 창 제목에 설비명을 붙인다."""
@@ -1148,6 +1152,7 @@ class SettingsDialog(_Dialog):
         self.check = tk.BooleanVar(value=cfg.check_on_start)
         self.show_share = tk.BooleanVar(value=cfg.show_share)
         self.title_name = tk.BooleanVar(value=cfg.title_with_name)
+        self.quiet = tk.BooleanVar(value=cfg.quiet_connect)
 
         box = ttk.Combobox(b, textvariable=self.vtype, state="readonly",
                            values=[VIEWERS[k]["label"] for k in self.keys])
@@ -1169,6 +1174,8 @@ class SettingsDialog(_Dialog):
                    "비우면 프로그램 폴더의 equipment.json. 공유 폴더 경로를 넣으면 여러 PC가 같이 씁니다")
         self.field("", ttk.Checkbutton(b, text="프로그램을 켤 때 설비 상태 확인", variable=self.check))
         self.field("", ttk.Checkbutton(b, text="VNC 창 제목 표시줄에 설비명 표시", variable=self.title_name))
+        self.field("", ttk.Checkbutton(b, text="접속 도중 뜨는 상태창 숨기기", variable=self.quiet),
+                   "UltraVNC 에 적용. 비밀번호 입력창은 설비 비밀번호를 저장해 두면 뜨지 않습니다")
         self.field("", ttk.Checkbutton(b, text="공유폴더 버튼 사용", variable=self.show_share),
                    "끄면 모든 설비에서 사라집니다. 설비별로 끄려면 설비를 오른쪽 클릭하세요")
         box.bind("<<ComboboxSelected>>", lambda _e: self._sync())
@@ -1228,7 +1235,8 @@ class SettingsDialog(_Dialog):
             custom_pw_args=self.cpw.get().strip() if key == "custom" else self.cfg.custom_pw_args,
             equipment_file=self.efile.get().strip().strip('"'),
             check_on_start=self.check.get(), check_timeout=self.cfg.check_timeout,
-            show_share=self.show_share.get(), title_with_name=self.title_name.get())
+            show_share=self.show_share.get(), title_with_name=self.title_name.get(),
+            quiet_connect=self.quiet.get())
         if self.on_save and self.on_save(cfg):
             self.top.destroy()
 

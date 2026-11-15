@@ -135,7 +135,9 @@ def test_build_command_per_viewer():
     cmd = lambda t, pw="": core.build_command(Config(viewer_type=t, viewer_path="v.exe"), e, pw)
     assert cmd("tightvnc") == ["v.exe", "-host=10.0.0.1", "-port=5901"]
     assert cmd("tightvnc", "p w") == ["v.exe", "-host=10.0.0.1", "-port=5901", "-password=p w"]
-    assert cmd("ultravnc", "pw") == ["v.exe", "-connect", "10.0.0.1::5901", "-password", "pw"]
+    assert cmd("ultravnc", "pw") == ["v.exe", "-connect", "10.0.0.1::5901", "-password", "pw", "-nostatus"]
+    loud = Config(viewer_type="ultravnc", viewer_path="v.exe", quiet_connect=False)
+    assert core.build_command(loud, e) == ["v.exe", "-connect", "10.0.0.1::5901"]
     assert cmd("realvnc", "pw") == ["v.exe", "10.0.0.1::5901"]  # 비밀번호 전달 불가 뷰어
 
 
@@ -214,7 +216,7 @@ def test_config_roundtrip_with_bom(tmp_path):
     cfg = Config(viewer_type="ultravnc", viewer_path=r"C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe",
                  extra_args="-fullscreen", equipment_file=r"\\서버\공유\equipment.json",
                  check_on_start=False, check_timeout=2.5, custom_args="%h {host}",
-                 show_share=False, title_with_name=False)
+                 show_share=False, title_with_name=False, quiet_connect=False)
     core.save_config(cfg, p)
     assert core.load_config(p) == cfg
     raw = open(p, "rb").read()
