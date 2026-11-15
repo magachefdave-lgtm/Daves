@@ -6,6 +6,7 @@ import queue
 import re
 import subprocess
 import sys
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
@@ -20,35 +21,58 @@ from .core import (OS_CHOICES, OS_WINDOWS, VIEWERS, Config, Equipment,
 ALL_GROUPS = "전체"
 NO_GROUP = "그룹 없음"
 
-# 색 - 산업용 모니터링 화면의 원칙(ISA-101 계열)을 따른다:
-# 바탕과 정상 상태는 무채색으로 조용하게, 색은 "응답 없음"(빨강)과 "접속 중"(파랑)에만 쓴다.
-BG = "#dde1e6"          # 설비 버튼이 놓이는 바탕
-BAR = "#eceef1"         # 그룹 줄, 아래 상태 줄
+# 색 - 두 가지 원칙을 같이 쓴다.
+# 1) 산업용 모니터링 화면(ISA-101 계열): 바탕과 정상 상태는 무채색, 색은 "응답 없음"(빨강)과
+#    "접속 중"(파랑)에만 쓴다.
+# 2) 질감: 은회색 바탕 위에 받침판(그룹)을 깔고 그 위에 흰 버튼을 띄운다. 테두리는 머리카락 굵기,
+#    그림자는 옅게, 모서리는 받침판과 버튼이 같은 중심을 갖도록(받침판 16 = 여백 6 + 버튼 10).
+BG = "#eceef1"          # 은회색 바탕
+TRAY = "#e2e5e9"        # 그룹 받침판
+TRAY_LINE = "#d5d9df"
 CARD = "#ffffff"        # 대화상자, 메뉴
-TILE = "#f7f8f9"        # 설비 버튼 (정상)
-BORDER = "#bfc6ce"
-TEXT = "#1b232c"
-SUB = "#5f6b78"
-HEAD = "#25313d"        # 위쪽 띠
-HEAD_FIELD = "#33424f"
-HEAD_HOVER = "#435464"
-HEAD_TEXT = "#f1f3f5"
-HEAD_SUB = "#a7b2be"
+TILE = "#fdfdfe"        # 설비 버튼 (정상)
+BORDER = "#dfe3e8"      # 버튼 테두리 (머리카락 굵기)
+SHADOW = "#cfd4db"      # 버튼 아래 옅은 그림자
+SHADOW_DEEP = "#b3bac4"
+TEXT = "#171c22"
+SUB = "#68727e"
+HEAD = "#1a2028"        # 떠 있는 위쪽 바
+HEAD_FIELD = "#2a323c"
+HEAD_HOVER = "#3a4450"
+HEAD_TEXT = "#f4f5f7"
+HEAD_SUB = "#98a2ae"
 ACCENT = "#1f5fd6"      # 접속 중
 ACCENT_DARK = "#184cad"
 SOFT = "#e6e9ed"
 SOFT_HOVER = "#d5dae0"
 ALERT = "#c0271d"       # 응답 없음
-ALERT_BG = "#fbe4e1"
-ALERT_LINE = "#dd8f88"
+ALERT_DARK = "#a01f17"
+ALERT_BG = "#fbe6e3"
+ALERT_LINE = "#eab5b0"
 ALERT_TEXT = "#8a1c14"
 NORMAL = "#5b8a72"      # 정상: 채도를 낮춘 녹색 점
-IDLE = "#8d98a5"
+IDLE = "#98a2ae"
 STATUS_WORD = {True: "접속 가능", False: "응답 없음", "busy": "확인 중"}
-RADIUS = 4
+RADIUS = 10             # 설비 버튼 모서리
+TRAY_PAD = 6            # 받침판 안쪽 여백
+TRAY_RADIUS = RADIUS + TRAY_PAD
+
+
+def mix(a: str, b: str, t: float) -> str:
+    """색 a 에서 b 로 t(0~1)만큼 섞는다."""
+    t = max(0.0, min(1.0, t))
+    pa, pb = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(pa, pb))
+
+
+def ease(t: float) -> float:
+    """빨리 출발해 천천히 멎는 곡선 - 물건이 무게를 갖고 자리에 앉는 느낌."""
+    t = max(0.0, min(1.0, t))
+    return 1 - (1 - t) ** 4
+
 
 # 설비 버튼 크기: 화면에 다 들어오도록 TILE_W_WIDE 에서 TILE_W_NARROW 까지 줄인다.
-TILE_W_WIDE, TILE_W_NARROW, TILE_H, GAP, PAD, GROUP_GAP = 176, 118, 36, 6, 16, 10
+TILE_W_WIDE, TILE_W_NARROW, TILE_H, GAP, PAD, GROUP_GAP = 176, 118, 36, 6, 16, 8
 HINT = "클릭 = VNC 접속   ·   폴더 아이콘 = 공유폴더   ·   오른쪽 클릭 = 수정 / 삭제 / 그룹 이동"
 
 
@@ -66,24 +90,61 @@ def round_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
     return c.create_polygon(pts, smooth=True, **kw)
 
 
-class FlatButton(tk.Label):
-    """테두리 없는 평면 버튼."""
+class PillButton(tk.Canvas):
+    """알약 모양 버튼. 마우스를 올리면 색이 부드럽게 바뀌고, 누르면 살짝 내려앉는다."""
 
-    def __init__(self, parent, text, command, primary=False, font=None):
-        self.colors = (ACCENT, ACCENT_DARK, "#ffffff") if primary else (HEAD_FIELD, HEAD_HOVER, HEAD_TEXT)
-        super().__init__(parent, text=text, bg=self.colors[0], fg=self.colors[2], font=font,
-                         padx=12, pady=5, cursor="hand2")
-        self.command, self.enabled = command, True
-        self.bind("<Enter>", lambda _e: self.enabled and self.configure(bg=self.colors[1]))
-        self.bind("<Leave>", lambda _e: self.enabled and self.configure(bg=self.colors[0]))
-        self.bind("<ButtonRelease-1>", lambda _e: self.enabled and self.command())
+    def __init__(self, parent, text, command, font, colors, bg):
+        super().__init__(parent, height=30, highlightthickness=0, bg=bg, cursor="hand2")
+        self.font, self.colors, self.command, self.enabled = font, colors, command, True
+        self.now = colors[0]
+        self.job = None
+        self.down = False
+        self.set_text(text)
+        self.bind("<Enter>", lambda _e: self.enabled and self.fade(self.colors[1]))
+        self.bind("<Leave>", lambda _e: self.enabled and self.fade(self.colors[0]))
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def set_text(self, text: str):
+        self.text = text
+        w = self.font.measure(text) + 30
+        self.configure(width=w)
+        self.delete("all")
+        self.shape = round_rect(self, 0, 0, w - 1, 29, 15, fill=self.now, outline="")
+        self.label = self.create_text(w / 2, 15, text=text, font=self.font,
+                                      fill=self.colors[2] if self.enabled else HEAD_SUB)
+        self.down = False
+
+    def fade(self, to: str, ms: int = 160):
+        if self.job:
+            self.after_cancel(self.job)
+        start, t0 = self.now, time.monotonic()
+
+        def step():
+            t = (time.monotonic() - t0) * 1000 / ms
+            self.now = mix(start, to, ease(t))
+            self.itemconfigure(self.shape, fill=self.now)
+            self.job = self.after(16, step) if t < 1 else None
+
+        step()
+
+    def _press(self, _event):
+        if self.enabled and not self.down:
+            self.move("all", 0, 1)
+            self.down = True
+
+    def _release(self, event):
+        if self.down:
+            self.move("all", 0, -1)
+            self.down = False
+        if self.enabled and 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height():
+            self.command()
 
     def set_enabled(self, flag: bool, text: str | None = None):
         self.enabled = flag
-        self.configure(bg=self.colors[0], fg=self.colors[2] if flag else HEAD_SUB,
-                       cursor="hand2" if flag else "")
-        if text:
-            self.configure(text=text)
+        self.configure(cursor="hand2" if flag else "")
+        self.now = self.colors[0]
+        self.set_text(text or self.text)
 
 
 class App:
@@ -104,6 +165,9 @@ class App:
         self.seen_mtime = 0.0
         self.scrollable = False
         self.only_down = False   # 응답 없는 설비만 보기
+        self.gen = 0             # 화면을 다시 그릴 때마다 1 증가
+        self.sunk = None         # 눌려서 내려앉은 설비 버튼
+        self.reveal = 0.0        # 처음 나타나는 정도 (1 이상 = 다 나타남)
         self._draw_job = self._toast_job = None
         self.store = EquipmentStore("")
 
@@ -127,8 +191,8 @@ class App:
             self._save_config()
         self.passwords = secret.PasswordStore(os.path.join(app_dir(), "passwords.json"))
         self._open_store()
-        self._show_sessions()
         self.reload()
+        self.root.after(60, self._reveal)
         if self.cfg.check_on_start:
             self.check_status()
         self.root.after(300, self._poll_results)
@@ -138,7 +202,9 @@ class App:
     # ------------------------------------------------------------ 화면 ---
 
     def _fonts(self):
-        family = "맑은 고딕" if sys.platform == "win32" else tkfont.nametofont("TkDefaultFont").actual("family")
+        installed = set(tkfont.families(self.root))
+        family = next((f for f in ("Pretendard", "Pretendard Variable", "맑은 고딕", "Malgun Gothic")
+                       if f in installed), tkfont.nametofont("TkDefaultFont").actual("family"))
         f = lambda size, weight="normal": tkfont.Font(family=family, size=size, weight=weight)
         self.f_title, self.f_name = f(13, "bold"), f(10, "bold")
         self.f_body, self.f_small, self.f_group = f(10), f(9), f(10, "bold")
@@ -167,56 +233,64 @@ class App:
 
     def _build(self):
         root = self.root
-        head = tk.Frame(root, bg=HEAD)
+        # 위쪽 바: 창 가장자리에 붙이지 않고, 둥근 알약 모양으로 띄운다.
+        head = tk.Canvas(root, bg=BG, height=64, highlightthickness=0)
         head.pack(fill="x")
-
         row1 = tk.Frame(head, bg=HEAD)
-        row1.pack(fill="x", padx=PAD, pady=8)
-        self.more_btn = FlatButton(row1, "더보기  ▾", self._show_more, font=self.f_body)
+        island = head.create_window(PAD + 20, 33, anchor="w", window=row1)
+
+        def lay_island(event):
+            head.delete("island")
+            for grow, color in ((3, mix(BG, "#000000", 0.03)), (2, mix(BG, "#000000", 0.06)),
+                                (1, mix(BG, "#000000", 0.10))):   # 옅게 퍼지는 그림자
+                round_rect(head, PAD - grow, 11 - grow + 3, event.width - PAD + grow, 55 + grow + 3,
+                           22 + grow, fill=color, outline="", tags="island")
+            round_rect(head, PAD, 11, event.width - PAD, 55, 22, fill=HEAD, outline="", tags="island")
+            head.tag_lower("island")
+            head.itemconfigure(island, width=event.width - 2 * PAD - 32)
+
+        head.bind("<Configure>", lay_island)
+        quiet = (HEAD_FIELD, HEAD_HOVER, HEAD_TEXT)
+        self.more_btn = PillButton(row1, "더보기  ▾", self._show_more, self.f_body, quiet, HEAD)
         self.more_btn.pack(side="right")
-        self.check_btn = FlatButton(row1, "상태 확인", self.check_status, font=self.f_body)
+        self.check_btn = PillButton(row1, "상태 확인", self.check_status, self.f_body, quiet, HEAD)
         self.check_btn.pack(side="right", padx=6)
-        FlatButton(row1, "＋ 설비 추가", self.add, font=self.f_body).pack(side="right")
+        PillButton(row1, "＋  설비 추가", self.add, self.f_group, (HEAD_TEXT, "#ffffff", HEAD),
+                   HEAD).pack(side="right")
         tk.Label(row1, text=APP_NAME, font=self.f_title, bg=HEAD, fg=HEAD_TEXT).pack(side="left")
-        box = tk.Frame(row1, bg=HEAD_FIELD, highlightthickness=1, highlightbackground=HEAD_FIELD,
-                       highlightcolor=HEAD_SUB)
-        box.pack(side="left", padx=(16, 14))
-        tk.Label(box, text="검색", bg=HEAD_FIELD, fg=HEAD_SUB, font=self.f_small).pack(side="left", padx=(10, 4))
+        box = tk.Canvas(row1, width=232, height=30, bg=HEAD, highlightthickness=0)
+        box.pack(side="left", padx=(18, 14))
+        round_rect(box, 0, 0, 231, 29, 15, fill=HEAD_FIELD, outline="")
+        box.create_text(16, 15, anchor="w", text="검색", font=self.f_small, fill=HEAD_SUB)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.draw())
-        self.search = tk.Entry(box, textvariable=self.search_var, width=20, relief="flat", bg=HEAD_FIELD,
+        self.search = tk.Entry(box, textvariable=self.search_var, relief="flat", bg=HEAD_FIELD,
                                fg=HEAD_TEXT, font=self.f_body, insertbackground=HEAD_TEXT,
-                               highlightthickness=0)
-        self.search.pack(side="left", ipady=4, padx=(0, 10))
+                               highlightthickness=0, bd=0)
+        box.create_window(48, 15, anchor="w", window=self.search, width=168)
+        box.bind("<Button-1>", lambda _e: self.search.focus_set())
         self.search.focus_set()
         self.summary = tk.Label(row1, font=self.f_small, bg=HEAD, fg=HEAD_SUB)
         self.summary.pack(side="left")
         # 응답 없는 설비 수 - 있을 때만 빨갛게 나타나고, 누르면 그 설비만 보인다.
-        self.alert_lbl = tk.Label(row1, font=self.f_group, bg=ALERT, fg="#ffffff", padx=10, pady=3,
-                                  cursor="hand2")
-        self.alert_lbl.bind("<ButtonRelease-1>", lambda _e: self.toggle_only_down())
+        self.alert_btn = PillButton(row1, "", self.toggle_only_down, self.f_group,
+                                    (ALERT, ALERT_DARK, "#ffffff"), HEAD)
 
-        row2 = tk.Frame(root, bg=BAR)
-        row2.pack(fill="x")
-        tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
-        # 오른쪽 위: 지금 VNC로 접속해 있는 설비
-        self.active_lbl = tk.Label(row2, font=self.f_small, padx=10, pady=3, anchor="e")
-        self.active_lbl.pack(side="right", anchor="n", padx=(12, PAD), pady=6)
-        self.chips = tk.Canvas(row2, bg=BAR, height=28, highlightthickness=0)
-        self.chips.pack(side="left", fill="x", expand=True, padx=(PAD, 0), pady=6)
+        # 그룹 줄. 오른쪽 끝에는 지금 VNC로 접속해 있는 설비가 나온다.
+        self.chips = tk.Canvas(root, bg=BG, height=28, highlightthickness=0)
+        self.chips.pack(fill="x", padx=PAD, pady=(2, 6))
         self.chips.bind("<Configure>", lambda _e: self._draw_chips())
         self.chips.bind("<Button-1>", self._on_chip)
 
-        foot = tk.Frame(root, bg=BAR)
+        foot = tk.Frame(root, bg=BG)
         foot.pack(side="bottom", fill="x")
-        tk.Frame(root, bg=BORDER, height=1).pack(side="bottom", fill="x")
         for mark, color, word in (("▮", ACCENT, "접속 중"), ("■", ALERT, "응답 없음"),
                                   ("○", IDLE, "미확인"), ("●", NORMAL, "정상")):
-            tk.Label(foot, text=word, bg=BAR, fg=SUB, font=self.f_small).pack(side="right", padx=(0, 12))
-            tk.Label(foot, text=mark, bg=BAR, fg=color, font=self.f_small).pack(side="right", padx=(0, 3))
+            tk.Label(foot, text=word, bg=BG, fg=SUB, font=self.f_small).pack(side="right", padx=(0, 14))
+            tk.Label(foot, text=mark, bg=BG, fg=color, font=self.f_small).pack(side="right", padx=(0, 3))
         self.foot_var = tk.StringVar(value=HINT)
-        tk.Label(foot, textvariable=self.foot_var, bg=BAR, fg=SUB, font=self.f_small,
-                 anchor="w").pack(side="left", fill="x", expand=True, padx=PAD, pady=4)
+        tk.Label(foot, textvariable=self.foot_var, bg=BG, fg=SUB, font=self.f_small,
+                 anchor="w").pack(side="left", fill="x", expand=True, padx=PAD + 4, pady=(2, 8))
 
         body = tk.Frame(root, bg=BG)
         body.pack(fill="both", expand=True)
@@ -227,7 +301,7 @@ class App:
         c.bind("<Configure>", lambda _e: self.draw_later())
         c.bind("<Motion>", self._on_motion)
         c.bind("<Leave>", lambda _e: self._set_hover((None, None)))
-        c.bind("<ButtonPress-1>", lambda _e: setattr(self, "pressed", self.hover))
+        c.bind("<ButtonPress-1>", self._on_press)
         c.bind("<ButtonRelease-1>", self._on_click)
         c.bind("<Button-3>", self._on_right)
         c.bind("<MouseWheel>", lambda e: self._wheel(-1 if e.delta > 0 else 1))
@@ -271,26 +345,44 @@ class App:
             out.append((NO_GROUP, counts[""]))
         return out
 
+    def _active_text(self) -> str:
+        names = list(dict.fromkeys(s[1] for s in self.sessions))
+        if not names:
+            return ""
+        return "접속 중   " + ",  ".join(names[:3]) + (f"  외 {len(names) - 3}대" if len(names) > 3 else "")
+
     def _draw_chips(self):
         c = self.chips
         c.delete("all")
         width = max(c.winfo_width(), 200)
+        # 오른쪽 끝: 접속 중인 설비 (파란 알약). 없으면 흐린 글자만.
+        active = self._active_text()
+        if active:
+            aw = self.f_group.measure(active) + 44
+            round_rect(c, width - aw, 0, width - 1, 26, 13, fill=ACCENT, outline="")
+            c.create_rectangle(width - aw + 14, 7, width - aw + 18, 19, fill="#ffffff", outline="")
+            c.create_text(width - aw + 28, 13, anchor="w", text=active, font=self.f_group, fill="#ffffff")
+        else:
+            idle = "접속 중인 설비 없음"
+            aw = self.f_small.measure(idle) + 8
+            c.create_text(width - 4, 13, anchor="e", text=idle, font=self.f_small, fill=SUB)
+        room = width - aw - 16
         x = y = 0
         chips = [(f"chip:{name}", f"{name}  {count}", name == self.group)
                  for name, count in self._groups()]
         chips.append(("manage", "＋ 그룹 관리", None))
         for tag, label, on in chips:
-            w = self.f_small.measure(label) + 22
-            if x and x + w > width:
-                x, y = 0, y + 30
+            w = self.f_small.measure(label) + 26
+            if x and x + w > (room if y == 0 else width):
+                x, y = 0, y + 31
             if on is None:   # 그룹 관리: 글자만
-                c.create_rectangle(x, y, x + w, y + 26, fill=BAR, outline="", tags=(tag,))
+                c.create_rectangle(x, y, x + w, y + 26, fill=BG, outline="", tags=(tag,))
                 color = SUB
             elif on:         # 고른 그룹: 진한 무채색 (파랑은 "접속 중"에만 쓴다)
-                round_rect(c, x, y, x + w, y + 26, RADIUS, fill=HEAD, outline=HEAD, tags=(tag,))
+                round_rect(c, x, y, x + w, y + 26, 13, fill=HEAD, outline="", tags=(tag,))
                 color = "#ffffff"
             else:
-                round_rect(c, x, y, x + w - 1, y + 25, RADIUS, fill=TILE, outline=BORDER, tags=(tag,))
+                round_rect(c, x, y, x + w - 1, y + 25, 13, fill=TILE, outline=BORDER, tags=(tag,))
                 color = TEXT
             c.create_text(x + w / 2, y + 13, text=label, font=self.f_small, fill=color, tags=(tag,))
             x += w + 6
@@ -338,18 +430,21 @@ class App:
         self._draw_job = None
         c = self.canvas
         c.delete("all")
+        self.gen += 1                 # 진행 중이던 색 전환은 여기서 끝난다
         self.hover = (None, None)
         self.base = {}
+        self.sunk = None
         width, height = max(c.winfo_width(), 300), max(c.winfo_height(), 100)
         shown = self.visible()
         down = sum(1 for e in self.items if self.status.get(e.id) is False)
         self.summary["text"] = f"전체 {len(self.items)}대"
         if down or self.only_down:
-            self.alert_lbl["text"] = (f"응답 없음 {down}대만 보는 중  ✕" if self.only_down
-                                      else f"■  응답 없음 {down}대")
-            self.alert_lbl.pack(side="left", padx=(12, 0))
+            text = f"응답 없음 {down}대만 보는 중   ✕" if self.only_down else f"응답 없음  {down}대"
+            if self.alert_btn.text != text:
+                self.alert_btn.set_text(text)
+            self.alert_btn.pack(side="left", padx=(12, 0))
         else:
-            self.alert_lbl.pack_forget()
+            self.alert_btn.pack_forget()
         self._foot()
 
         if not shown:
@@ -369,16 +464,18 @@ class App:
             sections.setdefault(e.group, []).append(e)
         names = [g for g in self.store.groups if g in sections] + ([""] if "" in sections else [])
         labels = bool(names and names[0])
-        # 그룹 이름은 왼쪽 칸에 둔다 - 제목 줄을 따로 쓰지 않아 세로 공간을 아낀다.
+        # 그룹 이름은 받침판 왼쪽 칸에 둔다 - 제목 줄을 따로 쓰지 않아 세로 공간을 아낀다.
         label_w = 0
         if labels:
-            label_w = min(140, max(self.f_group.measure(g or NO_GROUP) for g in names) + 14)
-        avail = width - 2 * PAD - label_w
+            label_w = min(140, max(self.f_group.measure(g or NO_GROUP) for g in names) + 26)
+        avail = width - 2 * PAD - 2 * TRAY_PAD - label_w
         cols_for = lambda tile_w: max(1, int((avail + GAP) // (tile_w + GAP)))
+        top = 2
 
         def total(cols):
             rows = [(len(sections[g]) + cols - 1) // cols for g in names]
-            return sum(r * (TILE_H + GAP) - GAP for r in rows) + GROUP_GAP * (len(names) - 1) + 2 * PAD
+            return (sum(r * (TILE_H + GAP) - GAP + 2 * TRAY_PAD for r in rows)
+                    + GROUP_GAP * (len(names) - 1) + top + 6)
 
         # 넓은 버튼부터 시작해, 스크롤 없이 들어올 때까지 한 줄의 버튼 수를 늘린다.
         # 설비명 대부분(90%)이 잘리지 않는 폭까지만 줄인다. 유난히 긴 이름 몇 개는 … 로 줄인다.
@@ -389,24 +486,41 @@ class App:
         while cols < most and total(cols) > height:
             cols += 1
         tile_w = (avail - GAP * (cols - 1)) / cols
-        x0 = PAD + label_w
-        y = PAD
+        x0 = PAD + TRAY_PAD + label_w
+        y = top
         for n, g in enumerate(names):
             group_items = sections[g]
             rows = (len(group_items) + cols - 1) // cols
-            if n:
-                c.create_line(PAD, y - GROUP_GAP / 2, width - PAD, y - GROUP_GAP / 2, fill="#c9cfd6")
+            tray_h = rows * (TILE_H + GAP) - GAP + 2 * TRAY_PAD
+            # 처음 켤 때: 그룹이 위에서부터 차례로 떠오르며 나타난다.
+            a = ease((self.reveal - 0.09 * min(n, 6)) / 0.45)
+            lift = (1 - a) * 10
+            round_rect(c, PAD, y + lift, width - PAD, y + tray_h + lift, TRAY_RADIUS,
+                       fill=mix(BG, TRAY, a), outline=mix(BG, TRAY_LINE, a))
             if labels:
                 name = g or NO_GROUP
-                c.create_text(PAD, y + TILE_H / 2 - (7 if rows > 1 else 0), anchor="w", font=self.f_group,
-                              fill=TEXT, text=self._fit(name, self.f_group, label_w - 10))
+                ty = y + lift + TRAY_PAD + TILE_H / 2
+                c.create_text(PAD + 16, ty - (7 if rows > 1 else 0), anchor="w", font=self.f_group,
+                              fill=mix(TRAY, TEXT, a), text=self._fit(name, self.f_group, label_w - 22))
                 if rows > 1:
-                    c.create_text(PAD, y + TILE_H / 2 + 11, anchor="w", font=self.f_small, fill=SUB,
+                    c.create_text(PAD + 16, ty + 11, anchor="w", font=self.f_small, fill=mix(TRAY, SUB, a),
                                   text=f"{len(group_items)}대")
             for i, e in enumerate(group_items):
-                self._tile(e, x0 + (i % cols) * (tile_w + GAP), y + (i // cols) * (TILE_H + GAP), tile_w)
-            y += rows * (TILE_H + GAP) - GAP + GROUP_GAP
-        self._set_scroll(y - GROUP_GAP + PAD, height)
+                self._tile(e, x0 + (i % cols) * (tile_w + GAP),
+                           y + lift + TRAY_PAD + (i // cols) * (TILE_H + GAP), tile_w, a)
+            y += tray_h + GROUP_GAP
+        self._set_scroll(y - GROUP_GAP + 6, height)
+
+    def _reveal(self, t0: float | None = None):
+        """처음 켤 때 한 번, 화면이 0.7초에 걸쳐 차례로 나타난다."""
+        t0 = t0 or time.monotonic()
+        self.reveal = (time.monotonic() - t0) / 0.7
+        if self.reveal >= 1:
+            self.reveal = 2.0
+            self.draw()
+            return
+        self.draw()
+        self.root.after(16, lambda: self._reveal(t0))
 
     def _set_scroll(self, content_h: float, height: int):
         """내용이 화면보다 길 때만 스크롤 막대를 보인다."""
@@ -421,41 +535,46 @@ class App:
     def _share_on(self, e: Equipment) -> bool:
         return self.cfg.show_share and has_share(e)
 
-    def _tile(self, e: Equipment, x: float, y: float, w: float):
+    def _tile(self, e: Equipment, x: float, y: float, w: float, a: float = 1.0):
         c = self.canvas
         st = self.status.get(e.id)
         tid = f"id:{e.id}"
         body = (tid, "zone:body")
         mid = y + TILE_H / 2
         active = any(s[0] == e.id for s in self.sessions)
-        # (바탕, 테두리, 글자, 아이콘) - 정상은 무채색, 색은 이상(빨강)과 접속 중(파랑)에만
+        # (바탕, 테두리, 글자, 아이콘, 그림자) - 정상은 무채색, 색은 이상(빨강)과 접속 중(파랑)에만
         if active:
-            look = (ACCENT, ACCENT_DARK, "#ffffff", "#ffffff")
+            look = (ACCENT, ACCENT_DARK, "#ffffff", "#ffffff", mix(SHADOW, ACCENT, 0.35))
         elif st is False:
-            look = (ALERT_BG, ALERT_LINE, ALERT_TEXT, ALERT_TEXT)
+            look = (ALERT_BG, ALERT_LINE, ALERT_TEXT, ALERT_TEXT, mix(SHADOW, ALERT, 0.15))
         else:
-            look = (TILE, BORDER, TEXT, IDLE)
+            look = (TILE, BORDER, TEXT, IDLE, SHADOW)
+        if a < 1:   # 나타나는 중: 받침판 색에서 제 색으로
+            look = tuple(mix(TRAY, col, a) for col in look)
         self.base[e.id] = look
-        fill, outline, ink, icon = look
+        fill, outline, ink, icon, shadow = look
+        # 그림자는 버튼과 따로 둔다 - 버튼만 뜨고 가라앉아 깊이가 생긴다.
+        round_rect(c, x + 1, y + 2, x + w - 1, y + TILE_H + 2, RADIUS, fill=shadow, outline="",
+                   tags=(f"shadow:{e.id}",))
         round_rect(c, x, y, x + w, y + TILE_H, RADIUS, fill=fill, outline=outline, width=1,
                    tags=body + (f"card:{e.id}",))
         # 상태 표시: 색을 못 가려도 알 수 있게 모양도 다르게 한다.
         if active:
-            c.create_rectangle(x + 11, mid - 6, x + 16, mid + 6, fill="#ffffff", outline="", tags=body)
+            c.create_rectangle(x + 12, mid - 6, x + 16, mid + 6, fill=ink, outline="", tags=body)
         elif st is False:
-            c.create_rectangle(x + 9, mid - 5, x + 19, mid + 5, fill=ALERT, outline="", tags=body)
+            c.create_rectangle(x + 10, mid - 4, x + 18, mid + 4, fill=mix(TRAY, ALERT, a), outline="", tags=body)
         elif st is True:
-            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=NORMAL, outline="", tags=body)
+            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=mix(TRAY, NORMAL, a), outline="", tags=body)
         else:
-            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=IDLE, width=2, tags=body)
+            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=icon, width=2, tags=body)
         right = x + w - 6
-        if self._share_on(e):   # 공유폴더 버튼 (폴더 아이콘) - 평소엔 아이콘만, 마우스를 올리면 버튼 모양
+        if self._share_on(e):   # 공유폴더 버튼: 평소엔 가는 선 아이콘만, 마우스를 올리면 동그란 버튼
             share = (tid, "zone:share")
-            c.create_rectangle(right - 26, mid - 12, right, mid + 12, fill=fill, outline="",
-                               tags=share + (f"btn:{e.id}",))
+            c.create_oval(right - 26, mid - 13, right, mid + 13, fill=fill, outline="",
+                          tags=share + (f"btn:{e.id}",))
             cx = right - 13
-            c.create_polygon(cx - 7, mid - 6, cx - 2, mid - 6, cx, mid - 3, cx + 7, mid - 3,
-                             cx + 7, mid + 6, cx - 7, mid + 6, fill=icon, outline="",
+            c.create_polygon(cx - 6, mid - 5, cx - 2, mid - 5, cx, mid - 3, cx + 6, mid - 3,
+                             cx + 6, mid + 5, cx - 6, mid + 5, fill=fill, outline=icon,
                              tags=share + (f"ico:{e.id}",))
             right -= 30
         c.create_text(x + 26, mid, anchor="w", font=self.f_name, tags=body, fill=ink,
@@ -475,30 +594,64 @@ class App:
     def _by_id(self, eq_id) -> Equipment | None:
         return next((e for e in self.items if e.id == eq_id), None)
 
+    def _fade(self, tag: str, option: str, start: str, to: str, ms: int = 170):
+        """캔버스 항목의 색을 부드럽게 바꾼다. 화면을 다시 그리면(gen 이 바뀌면) 멈춘다."""
+        gen, t0, c = self.gen, time.monotonic(), self.canvas
+
+        def step():
+            if gen != self.gen:
+                return
+            t = (time.monotonic() - t0) * 1000 / ms
+            c.itemconfigure(tag, **{option: mix(start, to, ease(t))})
+            if t < 1:
+                self.root.after(16, step)
+
+        step()
+
     def _set_hover(self, new):
         old = self.hover
         if new == old:
             return
         c = self.canvas
+        blank = (TILE, BORDER, TEXT, IDLE, SHADOW)
         if old[0]:
-            fill, outline, _ink, icon = self.base.get(old[0], (TILE, BORDER, TEXT, IDLE))
-            c.itemconfigure(f"card:{old[0]}", outline=outline, width=1)
+            fill, outline, _ink, icon, shadow = self.base.get(old[0], blank)
             c.itemconfigure(f"btn:{old[0]}", fill=fill)
-            c.itemconfigure(f"ico:{old[0]}", fill=icon)
+            c.itemconfigure(f"ico:{old[0]}", fill=fill, outline=icon)
+            if old[0] != new[0]:   # 버튼을 떠날 때: 제자리로 내려앉는다
+                self._settle(None)
+                c.move(f"id:{old[0]}", 0, 1)
+                self._fade(f"card:{old[0]}", "outline", HEAD, outline)
+                self._fade(f"shadow:{old[0]}", "fill", SHADOW_DEEP, shadow)
         if new[0]:
-            fill, _outline, _ink, icon = self.base.get(new[0], (TILE, BORDER, TEXT, IDLE))
-            on_share = new[1] == "share"
+            fill, outline, _ink, icon, shadow = self.base.get(new[0], blank)
             active = fill == ACCENT
-            # 상태 색은 그대로 두고 테두리만 진하게 - 마우스를 올려도 상태가 가려지지 않는다.
-            c.itemconfigure(f"card:{new[0]}", outline=HEAD, width=2)
-            if on_share:
-                c.itemconfigure(f"btn:{new[0]}", fill="#ffffff" if active else HEAD)
-                c.itemconfigure(f"ico:{new[0]}", fill=ACCENT if active else "#ffffff")
+            if old[0] != new[0]:   # 버튼에 올라갈 때: 1px 떠오르고 그림자가 짙어진다
+                c.move(f"id:{new[0]}", 0, -1)
+                self._fade(f"card:{new[0]}", "outline", outline, "#ffffff" if active else HEAD)
+                self._fade(f"shadow:{new[0]}", "fill", shadow, SHADOW_DEEP)
+            # 상태 색은 그대로 둔다 - 마우스를 올려도 상태가 가려지지 않는다.
+            if new[1] == "share":
+                on = "#ffffff" if active else HEAD
+                c.itemconfigure(f"btn:{new[0]}", fill=on)
+                c.itemconfigure(f"ico:{new[0]}", fill=on, outline=ACCENT if active else "#ffffff")
             else:
-                c.itemconfigure(f"ico:{new[0]}", fill="#ffffff" if active else TEXT)
+                c.itemconfigure(f"ico:{new[0]}", outline="#ffffff" if active else TEXT)
         c.configure(cursor="hand2" if new[0] else "")
         self.hover = new
         self._foot()
+
+    def _on_press(self, _event):
+        """누르면 버튼이 그림자 위로 내려앉는다."""
+        self.pressed = self.hover
+        if self.hover[0] and not self.sunk:
+            self.canvas.move(f"id:{self.hover[0]}", 0, 2)
+            self.sunk = self.hover[0]
+
+    def _settle(self, _event):
+        if self.sunk:
+            self.canvas.move(f"id:{self.sunk}", 0, -2)
+            self.sunk = None
 
     def _foot(self):
         """아래 한 줄: 방금 한 일 > 마우스가 올라간 설비 정보 > 사용법."""
@@ -519,6 +672,7 @@ class App:
         self._set_hover(self._target())
 
     def _on_click(self, _event):
+        self._settle(None)
         eq_id, zone = self._target()
         if not eq_id or (eq_id, zone) != self.pressed:
             return
@@ -647,12 +801,7 @@ class App:
         self.root.after(1000, self._tick_sessions)
 
     def _show_sessions(self):
-        names = list(dict.fromkeys(s[1] for s in self.sessions))
-        if not names:
-            self.active_lbl.configure(text="접속 중인 설비 없음", bg=BAR, fg=SUB, font=self.f_small)
-            return
-        text = ",  ".join(names[:3]) + (f"  외 {len(names) - 3}대" if len(names) > 3 else "")
-        self.active_lbl.configure(text=f"▮  접속 중:  {text}", bg=ACCENT, fg="#ffffff", font=self.f_group)
+        self._draw_chips()
 
     def toggle_share(self, eq: Equipment):
         eq.share_enabled = not eq.share_enabled
