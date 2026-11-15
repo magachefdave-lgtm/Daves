@@ -43,6 +43,8 @@ HEAD_TEXT = "#f4f5f7"
 HEAD_SUB = "#98a2ae"
 ACCENT = "#1f5fd6"      # 접속 중
 ACCENT_DARK = "#184cad"
+TRYING_BG = "#e7effd"   # 접속 시도 중
+TRYING_LINE = "#8fb2f0"
 SOFT = "#e6e9ed"
 SOFT_HOVER = "#d5dae0"
 ALERT = "#c0271d"       # 응답 없음
@@ -157,7 +159,9 @@ class App:
         self.group = ALL_GROUPS
         self.hover = (None, None)   # (설비 id, 영역)
         self.pressed = (None, None)
-        self.sessions: list[tuple[str, str, subprocess.Popen]] = []  # 떠 있는 뷰어 (설비 id, 설비명, 프로세스)
+        # 떠 있는 뷰어: {id, name, proc, started, connected}. connected=False 는 "접속 시도 중"
+        self.sessions: list[dict] = []
+        self.boxes: dict[str, tuple] = {}  # 접속 시도 중인 설비 버튼의 위치 (움직이는 막대용)
         self.base: dict[str, tuple] = {}   # 설비 버튼의 평소 색 (마우스가 떠날 때 되돌린다)
         self.pool = ThreadPoolExecutor(max_workers=16)
         self.results: queue.Queue = queue.Queue()
@@ -345,27 +349,35 @@ class App:
             out.append((NO_GROUP, counts[""]))
         return out
 
-    def _active_text(self) -> str:
-        names = list(dict.fromkeys(s[1] for s in self.sessions))
-        if not names:
-            return ""
-        return "접속 중   " + ",  ".join(names[:3]) + (f"  외 {len(names) - 3}대" if len(names) > 3 else "")
+    def _session_names(self, connected: bool) -> list[str]:
+        return list(dict.fromkeys(s["name"] for s in self.sessions if s["connected"] == connected))
+
+    @staticmethod
+    def _join(names: list[str]) -> str:
+        return ",  ".join(names[:3]) + (f"  외 {len(names) - 3}대" if len(names) > 3 else "")
 
     def _draw_chips(self):
         c = self.chips
         c.delete("all")
         width = max(c.winfo_width(), 200)
-        # 오른쪽 끝: 접속 중인 설비 (파란 알약). 없으면 흐린 글자만.
-        active = self._active_text()
-        if active:
-            aw = self.f_group.measure(active) + 44
-            round_rect(c, width - aw, 0, width - 1, 26, 13, fill=ACCENT, outline="")
-            c.create_rectangle(width - aw + 14, 7, width - aw + 18, 19, fill="#ffffff", outline="")
-            c.create_text(width - aw + 28, 13, anchor="w", text=active, font=self.f_group, fill="#ffffff")
-        else:
+        # 오른쪽 끝: 접속 시도 중(옅은 파랑) / 접속 중(파랑) 인 설비. 없으면 흐린 글자만.
+        trying, active = self._session_names(False), self._session_names(True)
+        right = width
+        for names, word, fill, line, ink in ((active, "접속 중", ACCENT, ACCENT, "#ffffff"),
+                                             (trying, "접속 시도 중…", TRYING_BG, TRYING_LINE, ACCENT_DARK)):
+            if not names:
+                continue
+            text = f"{word}   {self._join(names)}"
+            w = self.f_group.measure(text) + 44
+            round_rect(c, right - w, 0, right - 1, 25, 13, fill=fill, outline=line)
+            c.create_rectangle(right - w + 14, 7, right - w + 18, 19, fill=ink, outline="")
+            c.create_text(right - w + 28, 13, anchor="w", text=text, font=self.f_group, fill=ink)
+            right -= w + 6
+        if right == width:
             idle = "접속 중인 설비 없음"
-            aw = self.f_small.measure(idle) + 8
+            right -= self.f_small.measure(idle) + 8
             c.create_text(width - 4, 13, anchor="e", text=idle, font=self.f_small, fill=SUB)
+        aw = width - right
         room = width - aw - 16
         x = y = 0
         chips = [(f"chip:{name}", f"{name}  {count}", name == self.group)
@@ -433,6 +445,7 @@ class App:
         self.gen += 1                 # 진행 중이던 색 전환은 여기서 끝난다
         self.hover = (None, None)
         self.base = {}
+        self.boxes = {}
         self.sunk = None
         width, height = max(c.winfo_width(), 300), max(c.winfo_height(), 100)
         shown = self.visible()
@@ -541,9 +554,13 @@ class App:
         tid = f"id:{e.id}"
         body = (tid, "zone:body")
         mid = y + TILE_H / 2
-        active = any(s[0] == e.id for s in self.sessions)
-        # (바탕, 테두리, 글자, 아이콘, 그림자) - 정상은 무채색, 색은 이상(빨강)과 접속 중(파랑)에만
-        if active:
+        mine = [s for s in self.sessions if s["id"] == e.id]
+        active = any(s["connected"] for s in mine)
+        trying = bool(mine) and not active
+        # (바탕, 테두리, 글자, 아이콘, 그림자) - 정상은 무채색, 색은 이상(빨강)과 접속(파랑)에만
+        if trying:
+            look = (TRYING_BG, TRYING_LINE, ACCENT_DARK, ACCENT, mix(SHADOW, ACCENT, 0.2))
+        elif active:
             look = (ACCENT, ACCENT_DARK, "#ffffff", "#ffffff", mix(SHADOW, ACCENT, 0.35))
         elif st is False:
             look = (ALERT_BG, ALERT_LINE, ALERT_TEXT, ALERT_TEXT, mix(SHADOW, ALERT, 0.15))
@@ -559,7 +576,12 @@ class App:
         round_rect(c, x, y, x + w, y + TILE_H, RADIUS, fill=fill, outline=outline, width=1,
                    tags=body + (f"card:{e.id}",))
         # 상태 표시: 색을 못 가려도 알 수 있게 모양도 다르게 한다.
-        if active:
+        if trying:   # 접속 시도 중: 버튼 아래쪽을 막대가 오간다 (_sweep 이 움직인다)
+            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=ACCENT, width=2, tags=body)
+            self.boxes[e.id] = (x, y, w)
+            c.create_rectangle(0, 0, 0, 0, fill=ACCENT, outline="", tags=body + (f"sweep:{e.id}",))
+            self._place_sweep(e.id)
+        elif active:
             c.create_rectangle(x + 12, mid - 6, x + 16, mid + 6, fill=ink, outline="", tags=body)
         elif st is False:
             c.create_rectangle(x + 10, mid - 4, x + 18, mid + 4, fill=mix(TRAY, ALERT, a), outline="", tags=body)
@@ -664,8 +686,12 @@ class App:
             self.foot_var.set(f"{eq.name}  공유폴더 열기:  {share_path(eq)}")
         else:
             st = self.status.get(eq.id)
+            mine = [s for s in self.sessions if s["id"] == eq.id]
+            word = STATUS_WORD.get(st, "상태 미확인")
+            if mine:
+                word = "접속 중" if any(s["connected"] for s in mine) else "접속 시도 중"
             parts = [eq.name, eq.host if eq.port == 5900 else f"{eq.host}:{eq.port}", eq.os,
-                     eq.group or NO_GROUP, STATUS_WORD.get(st, "상태 미확인"), eq.memo]
+                     eq.group or NO_GROUP, word, eq.memo]
             self.foot_var.set("   ·   ".join(p for p in parts if p))
 
     def _on_motion(self, _event):
@@ -780,29 +806,67 @@ class App:
                 "[더보기 > 설정]에서 뷰어 실행 파일 경로가 맞는지 확인하세요.\n"
                 f"({e})"))
         else:
-            self.sessions.append((eq.id, eq.name, proc))
+            first = not any(not s["connected"] for s in self.sessions)
+            self.sessions.append({"id": eq.id, "name": eq.name, "proc": proc,
+                                  "started": time.monotonic(), "connected": False})
             self._show_sessions()
             self.draw()
+            if first:
+                self._sweep()
             if secret.AVAILABLE and self.cfg.supports_password() and not pw:
                 self.toast(f"{eq.name}: 저장된 비밀번호가 없어 뷰어가 비밀번호를 묻습니다. "
                            "(오른쪽 클릭 > 수정, 또는 CSV 가져오기로 저장)")
             else:
-                self.toast(f"{eq.name} ({eq.host}) VNC 접속을 시작했습니다.")
+                self.toast(f"{eq.name} ({eq.host}) 접속 시도 중…")
 
     def _tick_sessions(self):
-        """뷰어 창이 닫혔는지 살피고, 떠 있는 뷰어 창 제목에 설비명을 붙인다."""
-        alive = [s for s in self.sessions if s[2].poll() is None]
-        if len(alive) != len(self.sessions):
-            self.sessions = alive
+        """뷰어 상태를 살핀다: 창이 떴는지(접속 시도 중 -> 접속 중), 닫혔는지. 창 제목에 설비명도 붙인다."""
+        changed = False
+        alive = []
+        for s in self.sessions:
+            if s["proc"].poll() is not None:       # 뷰어가 닫힘 (접속 실패 포함)
+                changed = True
+                if not s["connected"]:
+                    self.toast(f"{s['name']}: 접속하지 못했습니다. (뷰어가 바로 닫혔습니다)")
+                continue
+            alive.append(s)
+            windows = 0
+            try:
+                windows = wintitle.retitle(s["proc"].pid, s["name"], rename=self.cfg.title_with_name)
+            except Exception:   # 창을 못 살펴도 접속에는 지장이 없다
+                pass
+            if not s["connected"]:
+                waited = time.monotonic() - s["started"]
+                # 뷰어 창이 화면에 나타나면 시도가 끝난 것으로 본다. 창을 살필 수 없는 경우를
+                # 위해 시간 제한도 둔다.
+                if windows or waited > (20 if wintitle.AVAILABLE else 2.5):
+                    s["connected"] = True
+                    changed = True
+        self.sessions = alive
+        if changed:
             self._show_sessions()
             self.draw()
-        if self.cfg.title_with_name:
-            for _eq_id, name, proc in alive:
-                try:
-                    wintitle.retitle(proc.pid, name)
-                except Exception:   # 제목을 못 바꿔도 접속에는 지장이 없다
-                    pass
-        self.root.after(1000, self._tick_sessions)
+        trying = any(not s["connected"] for s in alive)
+        self.root.after(250 if trying else 1000, self._tick_sessions)
+
+    def _place_sweep(self, eq_id: str):
+        """접속 시도 중인 버튼 아래쪽에서 좌우로 오가는 막대의 지금 위치."""
+        box = self.boxes.get(eq_id)
+        if not box:
+            return
+        x, y, w = box
+        span, bar = w - 2 * RADIUS, 34
+        t = (time.monotonic() % 1.4) / 0.7           # 0~2: 갔다가 돌아온다
+        pos = ease(t if t <= 1 else 2 - t) * (span - bar)
+        left = x + RADIUS + pos
+        self.canvas.coords(f"sweep:{eq_id}", left, y + TILE_H - 4, left + bar, y + TILE_H - 2)
+
+    def _sweep(self):
+        if not any(not s["connected"] for s in self.sessions):
+            return
+        for eq_id in list(self.boxes):
+            self._place_sweep(eq_id)
+        self.root.after(30, self._sweep)
 
     def _show_sessions(self):
         self._draw_chips()

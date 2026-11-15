@@ -15,8 +15,8 @@ _WM_SETTEXT = 0x000C
 _SMTO_ABORTIFHUNG = 0x0002
 
 
-def retitle(pid: int, name: str) -> int:
-    """pid 프로세스의 보이는 최상위 창 제목에 설비명을 붙인다. 바꾼 창 수를 돌려준다."""
+def retitle(pid: int, name: str, rename: bool = True) -> int:
+    """pid 프로세스의 보이는 최상위 창 수를 돌려주고, rename 이면 그 제목에 설비명을 붙인다."""
     if not AVAILABLE:
         return 0
     import ctypes
@@ -32,10 +32,10 @@ def retitle(pid: int, name: str) -> int:
     user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                                            wintypes.LPCWSTR, wintypes.UINT, wintypes.UINT,
                                            ctypes.POINTER(ctypes.c_size_t)]
-    changed = 0
+    seen = 0
 
     def visit(hwnd, _lparam):
-        nonlocal changed
+        nonlocal seen
         owner = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
         if owner.value != pid or not user32.IsWindowVisible(hwnd):
@@ -45,14 +45,14 @@ def retitle(pid: int, name: str) -> int:
             return True
         buf = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = new_title(name, buf.value)
+        seen += 1
+        title = new_title(name, buf.value) if rename else None
         if title:
             # 뷰어가 멈춰 있어도 이 프로그램까지 멈추지 않도록 시간 제한을 둔다.
             result = ctypes.c_size_t()
-            if user32.SendMessageTimeoutW(hwnd, _WM_SETTEXT, 0, title, _SMTO_ABORTIFHUNG, 200,
-                                          ctypes.byref(result)):
-                changed += 1
+            user32.SendMessageTimeoutW(hwnd, _WM_SETTEXT, 0, title, _SMTO_ABORTIFHUNG, 200,
+                                       ctypes.byref(result))
         return True
 
     user32.EnumWindows(enum_proc(visit), 0)
-    return changed
+    return seen
