@@ -1,0 +1,163 @@
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from launcher import core, secret
+from launcher.core import Config, Equipment, EquipmentStore, StoreError
+
+
+def eq(name="EQ-01", host="10.0.0.1", **kw):
+    return Equipment(name=name, host=host, **kw)
+
+
+@pytest.fixture
+def store(tmp_path):
+    return EquipmentStore(str(tmp_path / "equipment.json"))
+
+
+def test_add_update_delete_roundtrip(store):
+    a, b = eq(), eq("EQ-02", "10.0.0.2", os="Linux")
+    store.add(a)
+    store.add(b)
+    a.memo = "식각"
+    store.update(a)
+    assert [(e.name, e.memo) for e in store.load()] == [("EQ-01", "식각"), ("EQ-02", "")]
+    assert store.delete([a.id]) == 1
+    assert [e.name for e in store.load()] == ["EQ-02"]
+
+
+def test_two_pcs_do_not_overwrite_each_other(store):
+    other_pc = EquipmentStore(store.path)
+    store.load()                      # 내 PC가 먼저 읽어 둔 뒤
+    other_pc.add(eq("EQ-A"))          # 다른 PC가 추가
+    store.add(eq("EQ-B", "10.0.0.2"))  # 내 PC가 추가 - EQ-A가 남아 있어야 한다
+    assert {e.name for e in store.load()} == {"EQ-A", "EQ-B"}
+
+
+def test_duplicate_name_rejected(store):
+    store.add(eq())
+    with pytest.raises(StoreError, match="같은 설비명"):
+        store.add(eq("eq-01", "10.0.0.9"))
+
+
+@pytest.mark.parametrize("host", ["", "-evil", "10.0.0.1 -x", "a/b", "한글"])
+def test_bad_host_rejected(store, host):
+    with pytest.raises(StoreError):
+        store.add(eq(host=host))
+
+
+@pytest.mark.parametrize("port", [0, 70000, -1])
+def test_bad_port_rejected(store, port):
+    with pytest.raises(StoreError, match="포트"):
+        store.add(eq(port=port))
+
+
+def test_corrupt_file_reports_backup(store):
+    store.add(eq())
+    store.add(eq("EQ-02", "10.0.0.2"))
+    with open(store.path, "w") as f:
+        f.write("{broken")
+    with pytest.raises(StoreError, match=r"\.bak"):
+        store.load()
+    assert [e.name for e in EquipmentStore(store.path + ".bak").load()] == ["EQ-01"]
+
+
+def test_share_path():
+    assert core.share_path(eq()) == r"\\10.0.0.1"
+    assert core.share_path(eq(share="D$")) == r"\\10.0.0.1\D$"
+    assert core.share_path(eq(share="/Data/Log/")) == r"\\10.0.0.1\Data\Log"
+    assert core.share_path(eq(share=r"\\nas\recipes")) == r"\\nas\recipes"
+    with pytest.raises(ValueError):
+        core.share_path(eq(os="Linux"))
+
+
+def test_build_command_per_viewer():
+    e = eq(port=5901)
+    cmd = lambda t, pw="": core.build_command(Config(viewer_type=t, viewer_path="v.exe"), e, pw)
+    assert cmd("tightvnc") == ["v.exe", "-host=10.0.0.1", "-port=5901"]
+    assert cmd("tightvnc", "p w") == ["v.exe", "-host=10.0.0.1", "-port=5901", "-password=p w"]
+    assert cmd("ultravnc", "pw") == ["v.exe", "-connect", "10.0.0.1::5901", "-password", "pw"]
+    assert cmd("realvnc", "pw") == ["v.exe", "10.0.0.1::5901"]  # 비밀번호 전달 불가 뷰어
+
+
+def test_build_command_custom_and_extra():
+    cfg = Config(viewer_type="custom", viewer_path="v.exe", custom_args="{host}:{port}",
+                 custom_pw_args="/pw {password}", extra_args="-fullscreen")
+    assert core.build_command(cfg, eq(), "{host}") == ["v.exe", "10.0.0.1:5900", "/pw", "{host}", "-fullscreen"]
+
+
+def test_build_command_needs_viewer_path():
+    with pytest.raises(StoreError, match="설정"):
+        core.build_command(Config(), eq())
+
+
+def test_csv_import_cp949_and_merge(store, tmp_path):
+    store.add(eq("EQ-01", "10.0.0.1", memo="old"))
+    p = tmp_path / "in.csv"
+    p.write_bytes("설비명,그룹,IP,포트,OS,공유폴더,메모\r\n"
+                  "EQ-01,1라인,10.0.0.11,5900.0,windows,D$,새 메모\r\n"
+                  "EQ-02,2라인,10.0.0.12,,리눅스,,\r\n"
+                  ",,,,,,\r\n"
+                  "EQ-03,2라인,,5900,Windows,,\r\n".encode("cp949"))
+    added, updated, problems = store.import_csv(str(p))
+    assert (added, updated) == (1, 1)
+    assert len(problems) == 1 and "5번째 줄" in problems[0]
+    items = {e.name: e for e in store.load()}
+    assert (items["EQ-01"].host, items["EQ-01"].share, items["EQ-01"].port) == ("10.0.0.11", "D$", 5900)
+    assert (items["EQ-02"].os, items["EQ-02"].port) == ("Linux", 5900)
+
+
+def test_csv_export_import_roundtrip(store, tmp_path):
+    src = [eq("설비-가", "10.0.0.1", group="A", share="D$", memo="쉼표, 포함"),
+           eq("설비-나", "10.0.0.2", os="Linux", port=5902)]
+    p = str(tmp_path / "out.csv")
+    core.export_csv(src, p)
+    assert open(p, "rb").read().startswith(b"\xef\xbb\xbf")
+    store.import_csv(p)
+    strip = lambda e: (e.name, e.group, e.host, e.port, e.os, e.share, e.memo)
+    assert [strip(e) for e in store.load()] == [strip(e) for e in src]
+
+
+def test_csv_missing_columns(store, tmp_path):
+    p = tmp_path / "bad.csv"
+    p.write_text("a,b\n1,2\n", encoding="utf-8")
+    with pytest.raises(StoreError, match="설비명"):
+        store.import_csv(str(p))
+
+
+def test_config_roundtrip_with_bom(tmp_path):
+    p = str(tmp_path / "config.ini")
+    cfg = Config(viewer_type="ultravnc", viewer_path=r"C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe",
+                 extra_args="-fullscreen", equipment_file=r"\\서버\공유\equipment.json",
+                 check_on_start=False, check_timeout=2.5, custom_args="%h {host}")
+    core.save_config(cfg, p)
+    assert core.load_config(p) == cfg
+    raw = open(p, "rb").read()
+    open(p, "wb").write(b"\xef\xbb\xbf" + raw)  # 메모장으로 저장한 경우
+    assert core.load_config(p) == cfg
+
+
+def test_password_store(tmp_path):
+    xor = lambda b: bytes(c ^ 0x5A for c in b)
+    ps = secret.PasswordStore(str(tmp_path / "pw.json"), xor, xor)
+    ps.set("a", "비번 1")
+    ps.set("b", "x")
+    assert ps.get("a") == "비번 1" and ps.has("b")
+    assert "비번" not in open(ps.path, encoding="utf-8").read()
+    ps.set("a", "")
+    ps.delete(["b"])
+    assert ps.get("a") == "" and not ps.has("b")
+
+
+def test_is_reachable():
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    assert core.is_reachable("127.0.0.1", port, 1.0)
+    srv.close()
+    assert not core.is_reachable("127.0.0.1", port, 0.5)

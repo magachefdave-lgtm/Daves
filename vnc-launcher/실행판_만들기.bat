@@ -1,0 +1,33 @@
+@echo off
+rem EquipmentRemote.exe 만들기 - Python 3.10 이상이 설치된 Windows PC에서 한 번만 실행
+rem (pip 로 pyinstaller 를 받아야 하므로 인터넷 또는 사내 PyPI 미러가 필요합니다)
+setlocal
+cd /d "%~dp0"
+
+echo [1/3] 빌드 도구 설치
+py -3 -m pip install --upgrade pyinstaller pytest
+if errorlevel 1 goto fail
+
+echo [2/3] 테스트
+py -3 -m pytest -q tests
+if errorlevel 1 goto fail
+
+echo [3/3] exe 빌드
+py -3 -m PyInstaller --noconfirm --clean --onefile --noconsole --name EquipmentRemote ^
+  --exclude-module pytest --exclude-module _pytest --exclude-module pluggy equipment_remote.py
+if errorlevel 1 goto fail
+
+copy /y "시작하기.txt" dist\ >nul
+copy /y "설비목록_예시.csv" dist\ >nul
+if not exist "dist\시작하기.txt" goto fail
+
+echo.
+echo 완료: dist 폴더의 내용을 통째로 사용할 PC에 복사하세요.
+pause
+exit /b 0
+
+:fail
+echo.
+echo 실패했습니다. 위의 오류 내용을 확인하세요. exe 는 만들어지지 않았습니다.
+pause
+exit /b 1

@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.spec
+config.ini
+equipment.json*
+passwords.json
+실행오류_안내.txt
