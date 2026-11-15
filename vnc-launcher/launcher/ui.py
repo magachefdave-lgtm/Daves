@@ -20,23 +20,32 @@ from .core import (OS_CHOICES, OS_WINDOWS, VIEWERS, Config, Equipment,
 ALL_GROUPS = "전체"
 NO_GROUP = "그룹 없음"
 
-# 색
-BG = "#f3f5f8"
-CARD = "#ffffff"
-CARD_HOVER = "#f0f6ff"
-BORDER = "#dfe4ea"
-TEXT = "#18212c"
-SUB = "#6a7686"
-ACCENT = "#2563eb"
-ACCENT_DARK = "#1d4fd7"
-ACTIVE_BG = "#e3edff"
-SOFT = "#e9eef5"
-SOFT_HOVER = "#dbe4f0"
-UP = "#16a34a"
-DOWN = "#dc2626"
-IDLE = "#b6bfca"
-STATUS_COLOR = {True: UP, False: DOWN}
+# 색 - 산업용 모니터링 화면의 원칙(ISA-101 계열)을 따른다:
+# 바탕과 정상 상태는 무채색으로 조용하게, 색은 "응답 없음"(빨강)과 "접속 중"(파랑)에만 쓴다.
+BG = "#dde1e6"          # 설비 버튼이 놓이는 바탕
+BAR = "#eceef1"         # 그룹 줄, 아래 상태 줄
+CARD = "#ffffff"        # 대화상자, 메뉴
+TILE = "#f7f8f9"        # 설비 버튼 (정상)
+BORDER = "#bfc6ce"
+TEXT = "#1b232c"
+SUB = "#5f6b78"
+HEAD = "#25313d"        # 위쪽 띠
+HEAD_FIELD = "#33424f"
+HEAD_HOVER = "#435464"
+HEAD_TEXT = "#f1f3f5"
+HEAD_SUB = "#a7b2be"
+ACCENT = "#1f5fd6"      # 접속 중
+ACCENT_DARK = "#184cad"
+SOFT = "#e6e9ed"
+SOFT_HOVER = "#d5dae0"
+ALERT = "#c0271d"       # 응답 없음
+ALERT_BG = "#fbe4e1"
+ALERT_LINE = "#dd8f88"
+ALERT_TEXT = "#8a1c14"
+NORMAL = "#5b8a72"      # 정상: 채도를 낮춘 녹색 점
+IDLE = "#8d98a5"
 STATUS_WORD = {True: "접속 가능", False: "응답 없음", "busy": "확인 중"}
+RADIUS = 4
 
 # 설비 버튼 크기: 화면에 다 들어오도록 TILE_W_WIDE 에서 TILE_W_NARROW 까지 줄인다.
 TILE_W_WIDE, TILE_W_NARROW, TILE_H, GAP, PAD, GROUP_GAP = 176, 118, 36, 6, 16, 10
@@ -61,7 +70,7 @@ class FlatButton(tk.Label):
     """테두리 없는 평면 버튼."""
 
     def __init__(self, parent, text, command, primary=False, font=None):
-        self.colors = (ACCENT, ACCENT_DARK, "#ffffff") if primary else (SOFT, SOFT_HOVER, TEXT)
+        self.colors = (ACCENT, ACCENT_DARK, "#ffffff") if primary else (HEAD_FIELD, HEAD_HOVER, HEAD_TEXT)
         super().__init__(parent, text=text, bg=self.colors[0], fg=self.colors[2], font=font,
                          padx=12, pady=5, cursor="hand2")
         self.command, self.enabled = command, True
@@ -71,7 +80,7 @@ class FlatButton(tk.Label):
 
     def set_enabled(self, flag: bool, text: str | None = None):
         self.enabled = flag
-        self.configure(bg=self.colors[0], fg=self.colors[2] if flag else SUB,
+        self.configure(bg=self.colors[0], fg=self.colors[2] if flag else HEAD_SUB,
                        cursor="hand2" if flag else "")
         if text:
             self.configure(text=text)
@@ -94,6 +103,7 @@ class App:
         self.pending = 0
         self.seen_mtime = 0.0
         self.scrollable = False
+        self.only_down = False   # 응답 없는 설비만 보기
         self._draw_job = self._toast_job = None
         self.store = EquipmentStore("")
 
@@ -157,46 +167,56 @@ class App:
 
     def _build(self):
         root = self.root
-        head = tk.Frame(root, bg=CARD)
+        head = tk.Frame(root, bg=HEAD)
         head.pack(fill="x")
-        tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
 
-        row1 = tk.Frame(head, bg=CARD)
-        row1.pack(fill="x", padx=PAD, pady=(10, 8))
+        row1 = tk.Frame(head, bg=HEAD)
+        row1.pack(fill="x", padx=PAD, pady=8)
         self.more_btn = FlatButton(row1, "더보기  ▾", self._show_more, font=self.f_body)
         self.more_btn.pack(side="right")
         self.check_btn = FlatButton(row1, "상태 확인", self.check_status, font=self.f_body)
         self.check_btn.pack(side="right", padx=6)
-        FlatButton(row1, "＋ 설비 추가", self.add, primary=True, font=self.f_group).pack(side="right")
-        tk.Label(row1, text=APP_NAME, font=self.f_title, bg=CARD, fg=TEXT).pack(side="left")
-        box = tk.Frame(row1, bg=BG, highlightthickness=1, highlightbackground=BORDER,
-                       highlightcolor=ACCENT)
-        box.pack(side="left", padx=(16, 12))
-        tk.Label(box, text="검색", bg=BG, fg=SUB, font=self.f_small).pack(side="left", padx=(10, 4))
+        FlatButton(row1, "＋ 설비 추가", self.add, font=self.f_body).pack(side="right")
+        tk.Label(row1, text=APP_NAME, font=self.f_title, bg=HEAD, fg=HEAD_TEXT).pack(side="left")
+        box = tk.Frame(row1, bg=HEAD_FIELD, highlightthickness=1, highlightbackground=HEAD_FIELD,
+                       highlightcolor=HEAD_SUB)
+        box.pack(side="left", padx=(16, 14))
+        tk.Label(box, text="검색", bg=HEAD_FIELD, fg=HEAD_SUB, font=self.f_small).pack(side="left", padx=(10, 4))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.draw())
-        self.search = tk.Entry(box, textvariable=self.search_var, width=20, relief="flat", bg=BG,
-                               fg=TEXT, font=self.f_body, insertbackground=TEXT, highlightthickness=0)
+        self.search = tk.Entry(box, textvariable=self.search_var, width=20, relief="flat", bg=HEAD_FIELD,
+                               fg=HEAD_TEXT, font=self.f_body, insertbackground=HEAD_TEXT,
+                               highlightthickness=0)
         self.search.pack(side="left", ipady=4, padx=(0, 10))
         self.search.focus_set()
-        self.summary = tk.Label(row1, font=self.f_small, bg=CARD, fg=SUB)
+        self.summary = tk.Label(row1, font=self.f_small, bg=HEAD, fg=HEAD_SUB)
         self.summary.pack(side="left")
+        # 응답 없는 설비 수 - 있을 때만 빨갛게 나타나고, 누르면 그 설비만 보인다.
+        self.alert_lbl = tk.Label(row1, font=self.f_group, bg=ALERT, fg="#ffffff", padx=10, pady=3,
+                                  cursor="hand2")
+        self.alert_lbl.bind("<ButtonRelease-1>", lambda _e: self.toggle_only_down())
 
-        row2 = tk.Frame(head, bg=CARD)
-        row2.pack(fill="x", padx=PAD, pady=(0, 8))
+        row2 = tk.Frame(root, bg=BAR)
+        row2.pack(fill="x")
+        tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
         # 오른쪽 위: 지금 VNC로 접속해 있는 설비
-        self.active_lbl = tk.Label(row2, font=self.f_small, padx=10, pady=4, anchor="e")
-        self.active_lbl.pack(side="right", anchor="n", padx=(12, 0))
-        self.chips = tk.Canvas(row2, bg=CARD, height=28, highlightthickness=0)
-        self.chips.pack(side="left", fill="x", expand=True)
+        self.active_lbl = tk.Label(row2, font=self.f_small, padx=10, pady=3, anchor="e")
+        self.active_lbl.pack(side="right", anchor="n", padx=(12, PAD), pady=6)
+        self.chips = tk.Canvas(row2, bg=BAR, height=28, highlightthickness=0)
+        self.chips.pack(side="left", fill="x", expand=True, padx=(PAD, 0), pady=6)
         self.chips.bind("<Configure>", lambda _e: self._draw_chips())
         self.chips.bind("<Button-1>", self._on_chip)
 
-        foot = tk.Frame(root, bg=BG)
+        foot = tk.Frame(root, bg=BAR)
         foot.pack(side="bottom", fill="x")
+        tk.Frame(root, bg=BORDER, height=1).pack(side="bottom", fill="x")
+        for mark, color, word in (("▮", ACCENT, "접속 중"), ("■", ALERT, "응답 없음"),
+                                  ("○", IDLE, "미확인"), ("●", NORMAL, "정상")):
+            tk.Label(foot, text=word, bg=BAR, fg=SUB, font=self.f_small).pack(side="right", padx=(0, 12))
+            tk.Label(foot, text=mark, bg=BAR, fg=color, font=self.f_small).pack(side="right", padx=(0, 3))
         self.foot_var = tk.StringVar(value=HINT)
-        tk.Label(foot, textvariable=self.foot_var, bg=BG, fg=SUB, font=self.f_small,
-                 anchor="w").pack(fill="x", padx=PAD, pady=(0, 6))
+        tk.Label(foot, textvariable=self.foot_var, bg=BAR, fg=SUB, font=self.f_small,
+                 anchor="w").pack(side="left", fill="x", expand=True, padx=PAD, pady=4)
 
         body = tk.Frame(root, bg=BG)
         body.pack(fill="both", expand=True)
@@ -263,12 +283,15 @@ class App:
             w = self.f_small.measure(label) + 22
             if x and x + w > width:
                 x, y = 0, y + 30
-            if on is None:   # 그룹 관리: 테두리만
-                round_rect(c, x + 1, y + 1, x + w - 1, y + 25, 12, fill=CARD, outline=BORDER, tags=(tag,))
-                color = ACCENT
+            if on is None:   # 그룹 관리: 글자만
+                c.create_rectangle(x, y, x + w, y + 26, fill=BAR, outline="", tags=(tag,))
+                color = SUB
+            elif on:         # 고른 그룹: 진한 무채색 (파랑은 "접속 중"에만 쓴다)
+                round_rect(c, x, y, x + w, y + 26, RADIUS, fill=HEAD, outline=HEAD, tags=(tag,))
+                color = "#ffffff"
             else:
-                round_rect(c, x, y, x + w, y + 26, 13, fill=ACCENT if on else SOFT, tags=(tag,))
-                color = "#ffffff" if on else TEXT
+                round_rect(c, x, y, x + w - 1, y + 25, RADIUS, fill=TILE, outline=BORDER, tags=(tag,))
+                color = TEXT
             c.create_text(x + w / 2, y + 13, text=label, font=self.f_small, fill=color, tags=(tag,))
             x += w + 6
         c.configure(height=y + 27)
@@ -290,6 +313,8 @@ class App:
         out = []
         for e in self.items:
             if self.group != ALL_GROUPS and (e.group or NO_GROUP) != self.group:
+                continue
+            if self.only_down and self.status.get(e.id) is not False:
                 continue
             hay = " ".join((e.name, e.group, e.host, e.os, e.memo)).casefold()
             if all(w in hay for w in words):
@@ -317,12 +342,20 @@ class App:
         self.base = {}
         width, height = max(c.winfo_width(), 300), max(c.winfo_height(), 100)
         shown = self.visible()
-        up = sum(1 for e in self.items if self.status.get(e.id) is True)
-        self.summary["text"] = f"전체 {len(self.items)}대  ·  접속 가능 {up}대"
+        down = sum(1 for e in self.items if self.status.get(e.id) is False)
+        self.summary["text"] = f"전체 {len(self.items)}대"
+        if down or self.only_down:
+            self.alert_lbl["text"] = (f"응답 없음 {down}대만 보는 중  ✕" if self.only_down
+                                      else f"■  응답 없음 {down}대")
+            self.alert_lbl.pack(side="left", padx=(12, 0))
+        else:
+            self.alert_lbl.pack_forget()
         self._foot()
 
         if not shown:
-            if self.items:
+            if self.only_down and self.items:
+                title, hint = "응답 없는 설비가 없습니다", "위의 빨간 표시를 다시 누르면 전체 설비가 보입니다"
+            elif self.items:
                 title, hint = "조건에 맞는 설비가 없습니다", "검색어를 지우거나 다른 그룹을 선택하세요"
             else:
                 title, hint = "등록된 설비가 없습니다", "[＋ 설비 추가] 또는 [더보기 > CSV 가져오기]로 설비를 등록하세요"
@@ -362,7 +395,7 @@ class App:
             group_items = sections[g]
             rows = (len(group_items) + cols - 1) // cols
             if n:
-                c.create_line(PAD, y - GROUP_GAP / 2, width - PAD, y - GROUP_GAP / 2, fill=BORDER)
+                c.create_line(PAD, y - GROUP_GAP / 2, width - PAD, y - GROUP_GAP / 2, fill="#c9cfd6")
             if labels:
                 name = g or NO_GROUP
                 c.create_text(PAD, y + TILE_H / 2 - (7 if rows > 1 else 0), anchor="w", font=self.f_group,
@@ -394,25 +427,39 @@ class App:
         tid = f"id:{e.id}"
         body = (tid, "zone:body")
         mid = y + TILE_H / 2
-        active = any(s[0] == e.id for s in self.sessions)   # 지금 접속 중인 설비는 파랗게
-        self.base[e.id] = (ACTIVE_BG, ACCENT, 2) if active else (CARD, BORDER, 1)
-        fill, outline, line = self.base[e.id]
-        round_rect(c, x, y, x + w, y + TILE_H, 10, fill=fill, outline=outline, width=line,
+        active = any(s[0] == e.id for s in self.sessions)
+        # (바탕, 테두리, 글자, 아이콘) - 정상은 무채색, 색은 이상(빨강)과 접속 중(파랑)에만
+        if active:
+            look = (ACCENT, ACCENT_DARK, "#ffffff", "#ffffff")
+        elif st is False:
+            look = (ALERT_BG, ALERT_LINE, ALERT_TEXT, ALERT_TEXT)
+        else:
+            look = (TILE, BORDER, TEXT, IDLE)
+        self.base[e.id] = look
+        fill, outline, ink, icon = look
+        round_rect(c, x, y, x + w, y + TILE_H, RADIUS, fill=fill, outline=outline, width=1,
                    tags=body + (f"card:{e.id}",))
-        c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=STATUS_COLOR.get(st, IDLE), outline="", tags=body)
-        right = x + w - 8
-        if self._share_on(e):   # 공유폴더 버튼 (폴더 아이콘)
+        # 상태 표시: 색을 못 가려도 알 수 있게 모양도 다르게 한다.
+        if active:
+            c.create_rectangle(x + 11, mid - 6, x + 16, mid + 6, fill="#ffffff", outline="", tags=body)
+        elif st is False:
+            c.create_rectangle(x + 9, mid - 5, x + 19, mid + 5, fill=ALERT, outline="", tags=body)
+        elif st is True:
+            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=NORMAL, outline="", tags=body)
+        else:
+            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=IDLE, width=2, tags=body)
+        right = x + w - 6
+        if self._share_on(e):   # 공유폴더 버튼 (폴더 아이콘) - 평소엔 아이콘만, 마우스를 올리면 버튼 모양
             share = (tid, "zone:share")
-            round_rect(c, right - 26, mid - 12, right, mid + 12, 7, fill=SOFT, outline="",
-                       tags=share + (f"btn:{e.id}",))
+            c.create_rectangle(right - 26, mid - 12, right, mid + 12, fill=fill, outline="",
+                               tags=share + (f"btn:{e.id}",))
             cx = right - 13
             c.create_polygon(cx - 7, mid - 6, cx - 2, mid - 6, cx, mid - 3, cx + 7, mid - 3,
-                             cx + 7, mid + 6, cx - 7, mid + 6, fill=SUB, outline="",
+                             cx + 7, mid + 6, cx - 7, mid + 6, fill=icon, outline="",
                              tags=share + (f"ico:{e.id}",))
-            right -= 32
-        c.create_text(x + 25, mid, anchor="w", font=self.f_name, tags=body,
-                      fill=SUB if st is False else TEXT,
-                      text=self._fit(e.name, self.f_name, right - (x + 25)))
+            right -= 30
+        c.create_text(x + 26, mid, anchor="w", font=self.f_name, tags=body, fill=ink,
+                      text=self._fit(e.name, self.f_name, right - (x + 26)))
 
     # ------------------------------------------------- 마우스, 키보드 ---
 
@@ -434,15 +481,21 @@ class App:
             return
         c = self.canvas
         if old[0]:
-            fill, outline, line = self.base.get(old[0], (CARD, BORDER, 1))
-            c.itemconfigure(f"card:{old[0]}", fill=fill, outline=outline, width=line)
-            c.itemconfigure(f"btn:{old[0]}", fill=SOFT)
-            c.itemconfigure(f"ico:{old[0]}", fill=SUB)
+            fill, outline, _ink, icon = self.base.get(old[0], (TILE, BORDER, TEXT, IDLE))
+            c.itemconfigure(f"card:{old[0]}", outline=outline, width=1)
+            c.itemconfigure(f"btn:{old[0]}", fill=fill)
+            c.itemconfigure(f"ico:{old[0]}", fill=icon)
         if new[0]:
+            fill, _outline, _ink, icon = self.base.get(new[0], (TILE, BORDER, TEXT, IDLE))
             on_share = new[1] == "share"
-            c.itemconfigure(f"card:{new[0]}", fill=CARD_HOVER, outline=ACCENT, width=2)
-            c.itemconfigure(f"btn:{new[0]}", fill=ACCENT if on_share else SOFT_HOVER)
-            c.itemconfigure(f"ico:{new[0]}", fill="#ffffff" if on_share else SUB)
+            active = fill == ACCENT
+            # 상태 색은 그대로 두고 테두리만 진하게 - 마우스를 올려도 상태가 가려지지 않는다.
+            c.itemconfigure(f"card:{new[0]}", outline=HEAD, width=2)
+            if on_share:
+                c.itemconfigure(f"btn:{new[0]}", fill="#ffffff" if active else HEAD)
+                c.itemconfigure(f"ico:{new[0]}", fill=ACCENT if active else "#ffffff")
+            else:
+                c.itemconfigure(f"ico:{new[0]}", fill="#ffffff" if active else TEXT)
         c.configure(cursor="hand2" if new[0] else "")
         self.hover = new
         self._foot()
@@ -501,6 +554,11 @@ class App:
         m.add_command(label="수정", command=lambda: self.edit(eq))
         m.add_command(label="삭제", command=lambda: self.delete(eq))
         m.tk_popup(event.x_root, event.y_root)
+
+    def toggle_only_down(self):
+        self.only_down = not self.only_down
+        self.canvas.yview_moveto(0)
+        self.draw()
 
     def _on_enter(self, _event):
         shown = self.visible()
@@ -591,10 +649,10 @@ class App:
     def _show_sessions(self):
         names = list(dict.fromkeys(s[1] for s in self.sessions))
         if not names:
-            self.active_lbl.configure(text="접속 중인 설비 없음", bg=CARD, fg=SUB, font=self.f_small)
+            self.active_lbl.configure(text="접속 중인 설비 없음", bg=BAR, fg=SUB, font=self.f_small)
             return
         text = ",  ".join(names[:3]) + (f"  외 {len(names) - 3}대" if len(names) > 3 else "")
-        self.active_lbl.configure(text=f"●  접속 중:  {text}", bg=ACTIVE_BG, fg=ACCENT, font=self.f_group)
+        self.active_lbl.configure(text=f"▮  접속 중:  {text}", bg=ACCENT, fg="#ffffff", font=self.f_group)
 
     def toggle_share(self, eq: Equipment):
         eq.share_enabled = not eq.share_enabled
