@@ -1,0 +1,40 @@
+name: Build equipment remote launcher (Windows exe)
+
+on:
+  push:
+    paths:
+      - "vnc-launcher/**"
+      - ".github/workflows/build-vnc-launcher.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: vnc-launcher
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: python -m pip install pyinstaller pytest
+      - name: Test
+        run: python -m pytest -q tests
+      - name: Build exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --noconsole
+          --name EquipmentRemote
+          --exclude-module pytest --exclude-module _pytest --exclude-module pluggy
+          equipment_remote.py
+      - name: Add user documents
+        run: Copy-Item *.txt, *.csv dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EquipmentRemote
+          path: vnc-launcher/dist/
+          if-no-files-found: error
