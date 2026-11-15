@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -38,3 +38,17 @@ jobs:
           name: EquipmentRemote
           path: vnc-launcher/dist/
           if-no-files-found: error
+      # Commit message containing [publish-zip] also stores the build in the branch,
+      # for places that cannot reach the Actions artifact storage.
+      - name: Publish zip to branch
+        if: contains(github.event.head_commit.message, '[publish-zip]')
+        shell: bash
+        working-directory: .
+        run: |
+          mkdir -p release
+          python -c "import zipfile,os; d='vnc-launcher/dist'; z=zipfile.ZipFile('release/EquipmentRemote.zip','w',zipfile.ZIP_DEFLATED); [z.write(os.path.join(d,f),'EquipmentRemote/'+f) for f in sorted(os.listdir(d))]; z.close()"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f release/EquipmentRemote.zip
+          git commit -m "Add built EquipmentRemote.zip"
+          git push
