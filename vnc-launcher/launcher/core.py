@@ -353,7 +353,7 @@ def build_command(cfg: Config, eq: Equipment, password: str = "") -> list[str]:
     if not cfg.viewer_path:
         raise StoreError(
             "VNC 뷰어 프로그램 경로가 설정되지 않았습니다.\n"
-            "[설정] 버튼을 눌러 뷰어 실행 파일(예: tvnviewer.exe)을 지정하세요."
+            "[더보기 > 설정]에서 뷰어 실행 파일(예: tvnviewer.exe)을 지정하세요."
         )
     errors = validate(eq)
     if errors:
@@ -422,7 +422,7 @@ def load_config(path: str) -> Config:
 
 
 def save_config(cfg: Config, path: str) -> None:
-    text = f"""; 설비 원격 접속 설정 파일 (프로그램의 [설정] 화면에서 바꾸는 것을 권장합니다)
+    text = f"""; 설비 원격 접속 설정 파일 (프로그램의 [더보기 > 설정] 화면에서 바꾸는 것을 권장합니다)
 
 [viewer]
 ; VNC 뷰어 종류: tightvnc / ultravnc / realvnc / tigervnc / custom

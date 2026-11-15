@@ -1,11 +1,13 @@
-"""tkinter 화면."""
+"""tkinter 화면 - 설비를 카드형 버튼으로 보여 준다."""
 from __future__ import annotations
 
 import os
 import queue
+import re
 import subprocess
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
 
@@ -15,24 +17,65 @@ from .core import (OS_CHOICES, OS_WINDOWS, VIEWERS, Config, Equipment,
                    detect_viewer, equipment_file, export_csv, is_reachable,
                    load_config, save_config, share_path)
 
-ALL_GROUPS = "전체 그룹"
-COLUMNS = (  # (키, 제목, 너비, 정렬)
-    ("status", "상태", 90, "w"),
-    ("name", "설비명", 170, "w"),
-    ("group", "그룹", 110, "w"),
-    ("host", "IP", 130, "w"),
-    ("port", "포트", 60, "e"),
-    ("os", "OS", 80, "w"),
-    ("share", "공유폴더", 110, "w"),
-    ("memo", "메모", 220, "w"),
-)
-STATUS_TEXT = {None: "-", True: "● 접속 가능", False: "● 응답 없음", "busy": "확인 중..."}
+ALL_GROUPS = "전체"
+NO_GROUP = "그룹 없음"
+
+# 색
+BG = "#f3f5f8"
+CARD = "#ffffff"
+CARD_HOVER = "#f0f6ff"
+BORDER = "#dfe4ea"
+TEXT = "#18212c"
+SUB = "#6a7686"
+ACCENT = "#2563eb"
+ACCENT_DARK = "#1d4fd7"
+SOFT = "#e9eef5"
+SOFT_HOVER = "#dbe4f0"
+UP = "#16a34a"
+DOWN = "#dc2626"
+IDLE = "#b6bfca"
+STATUS_COLOR = {True: UP, False: DOWN}
+STATUS_WORD = {True: "접속 가능", False: "응답 없음", "busy": "확인 중"}
+
+TILE_MIN_W, TILE_H, GAP, PAD = 230, 78, 12, 20
 
 
 def launch(cmd: list[str]) -> None:
     # 콘솔 없는 exe에서는 표준 핸들이 유효하지 않아 넘겨주지 않으면 WinError 6이 난다.
     subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, close_fds=True)
+
+
+def natural_key(text: str):
+    return [(0, int(p)) if p.isdigit() else (1, p.casefold()) for p in re.split(r"(\d+)", text)]
+
+
+def round_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
+    # 꼭짓점 앞뒤 점을 두 번씩 넣어야 변이 곧게 그려진다.
+    pts = [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y1 + r,
+           x2, y2 - r, x2, y2 - r, x2, y2, x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2,
+           x1, y2, x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
+    return c.create_polygon(pts, smooth=True, **kw)
+
+
+class FlatButton(tk.Label):
+    """테두리 없는 평면 버튼."""
+
+    def __init__(self, parent, text, command, primary=False, font=None):
+        self.colors = (ACCENT, ACCENT_DARK, "#ffffff") if primary else (SOFT, SOFT_HOVER, TEXT)
+        super().__init__(parent, text=text, bg=self.colors[0], fg=self.colors[2], font=font,
+                         padx=14, pady=7, cursor="hand2")
+        self.command, self.enabled = command, True
+        self.bind("<Enter>", lambda _e: self.enabled and self.configure(bg=self.colors[1]))
+        self.bind("<Leave>", lambda _e: self.enabled and self.configure(bg=self.colors[0]))
+        self.bind("<ButtonRelease-1>", lambda _e: self.enabled and self.command())
+
+    def set_enabled(self, flag: bool, text: str | None = None):
+        self.enabled = flag
+        self.configure(bg=self.colors[0], fg=self.colors[2] if flag else SUB,
+                       cursor="hand2" if flag else "")
+        if text:
+            self.configure(text=text)
 
 
 class App:
@@ -42,15 +85,22 @@ class App:
         self.cfg = Config()
         self.items: list[Equipment] = []
         self.status: dict[str, object] = {}
-        self.sort_key, self.sort_rev = "name", False
+        self.group = ALL_GROUPS
+        self.hover = (None, None)   # (설비 id, 영역)
+        self.pressed = (None, None)
+        self.menu_target: Equipment | None = None
         self.pool = ThreadPoolExecutor(max_workers=16)
         self.results: queue.Queue = queue.Queue()
         self.pending = 0
         self.seen_mtime = 0.0
+        self._draw_job = self._toast_job = None
 
         root.title(f"{APP_NAME} v{APP_VERSION}")
-        root.geometry("1040x620")
-        root.minsize(820, 420)
+        root.geometry("1100x700")
+        root.minsize(720, 420)
+        root.configure(bg=BG)
+        self._fonts()
+        self._style()
         self._build()
 
         first_run = not os.path.exists(self.config_path)
@@ -73,81 +123,336 @@ class App:
 
     # ------------------------------------------------------------ 화면 ---
 
+    def _fonts(self):
+        family = "맑은 고딕" if sys.platform == "win32" else tkfont.nametofont("TkDefaultFont").actual("family")
+        f = lambda size, weight="normal": tkfont.Font(family=family, size=size, weight=weight)
+        self.f_title, self.f_name = f(15, "bold"), f(11, "bold")
+        self.f_body, self.f_small, self.f_group = f(10), f(9), f(10, "bold")
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(name).configure(family=family, size=10)
+
+    def _style(self):
+        st = ttk.Style(self.root)
+        st.theme_use("clam")
+        st.configure(".", background=CARD, foreground=TEXT, bordercolor=BORDER,
+                     lightcolor=CARD, darkcolor=CARD, troughcolor=BG, focuscolor=ACCENT)
+        st.configure("TButton", background=SOFT, bordercolor=SOFT, padding=(14, 6), relief="flat")
+        st.map("TButton", background=[("active", SOFT_HOVER)])
+        st.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", bordercolor=ACCENT)
+        st.map("Accent.TButton", background=[("active", ACCENT_DARK)])
+        st.configure("TEntry", fieldbackground=CARD, padding=5)
+        st.configure("TCombobox", fieldbackground=CARD, background=CARD, padding=5, arrowcolor=SUB)
+        st.map("TCombobox", fieldbackground=[("readonly", CARD)], bordercolor=[("focus", ACCENT)])
+        st.map("TEntry", bordercolor=[("focus", ACCENT)],
+               fieldbackground=[("disabled", BG), ("readonly", BG)])
+        st.configure("TCheckbutton", background=CARD)
+        st.configure("Vertical.TScrollbar", background="#cfd6df", troughcolor=BG, bordercolor=BG,
+                     arrowcolor=BG, relief="flat", width=10)
+        self.root.option_add("*TCombobox*Listbox.background", CARD)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+
     def _build(self):
         root = self.root
-        style = ttk.Style(root)
-        if sys.platform == "win32":
-            style.configure(".", font=("맑은 고딕", 10))
-            style.configure("Treeview.Heading", font=("맑은 고딕", 10, "bold"))
-        style.configure("Treeview", rowheight=26)
-        style.configure("Main.TButton", font=("맑은 고딕", 11, "bold") if sys.platform == "win32" else None)
+        head = tk.Frame(root, bg=CARD)
+        head.pack(fill="x")
+        tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
 
-        top = ttk.Frame(root, padding=(10, 10, 10, 6))
-        top.pack(fill="x")
-        ttk.Label(top, text="검색").pack(side="left")
+        row1 = tk.Frame(head, bg=CARD)
+        row1.pack(fill="x", padx=PAD, pady=(16, 10))
+        self.more_btn = FlatButton(row1, "더보기  ▾", self._show_more, font=self.f_body)
+        self.more_btn.pack(side="right")
+        self.check_btn = FlatButton(row1, "상태 확인", self.check_status, font=self.f_body)
+        self.check_btn.pack(side="right", padx=8)
+        FlatButton(row1, "＋ 설비 추가", self.add, primary=True, font=self.f_group).pack(side="right")
+
+        tk.Label(row1, text=APP_NAME, font=self.f_title, bg=CARD, fg=TEXT).pack(side="left")
+        self.summary = tk.Label(row1, font=self.f_body, bg=CARD, fg=SUB)
+        self.summary.pack(side="left", padx=14, pady=(4, 0))
+        row2 = tk.Frame(head, bg=CARD)
+        row2.pack(fill="x", padx=PAD, pady=(0, 14))
+        box = tk.Frame(row2, bg=BG, highlightthickness=1, highlightbackground=BORDER,
+                       highlightcolor=ACCENT)
+        box.pack(side="left")
+        tk.Label(box, text="검색", bg=BG, fg=SUB, font=self.f_small).pack(side="left", padx=(10, 4))
         self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *_: self.refresh_view())
-        entry = ttk.Entry(top, textvariable=self.search_var, width=28)
-        entry.pack(side="left", padx=(6, 12))
-        entry.focus_set()
-        self.group_var = tk.StringVar(value=ALL_GROUPS)
-        self.group_box = ttk.Combobox(top, textvariable=self.group_var, state="readonly", width=18)
-        self.group_box.pack(side="left")
-        self.group_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_view())
-        ttk.Button(top, text="설정", command=self.open_settings).pack(side="right")
-        self.check_btn = ttk.Button(top, text="상태 확인", command=self.check_status)
-        self.check_btn.pack(side="right", padx=6)
+        self.search_var.trace_add("write", lambda *_: self.draw())
+        self.search = tk.Entry(box, textvariable=self.search_var, width=24, relief="flat", bg=BG,
+                               fg=TEXT, font=self.f_body, insertbackground=TEXT, highlightthickness=0)
+        self.search.pack(side="left", ipady=6, padx=(0, 10))
+        self.search.focus_set()
+        self.chips = tk.Canvas(row2, bg=CARD, height=32, highlightthickness=0)
+        self.chips.pack(side="left", fill="x", expand=True, padx=(14, 0))
+        self.chips.bind("<Configure>", lambda _e: self._draw_chips())
+        self.chips.bind("<Button-1>", self._on_chip)
 
-        side = ttk.Frame(root, padding=(0, 0, 10, 6))
-        side.pack(side="right", fill="y")
-        self.vnc_btn = ttk.Button(side, text="VNC 접속", style="Main.TButton", command=self.connect)
-        self.vnc_btn.pack(fill="x", ipady=8)
-        self.share_btn = ttk.Button(side, text="공유폴더 열기", command=self.open_share)
-        self.share_btn.pack(fill="x", pady=(6, 0), ipady=4)
-        ttk.Separator(side).pack(fill="x", pady=12)
-        ttk.Button(side, text="설비 추가", command=self.add).pack(fill="x")
-        self.edit_btn = ttk.Button(side, text="수정", command=self.edit)
-        self.edit_btn.pack(fill="x", pady=4)
-        self.del_btn = ttk.Button(side, text="삭제", command=self.delete)
-        self.del_btn.pack(fill="x")
-        ttk.Separator(side).pack(fill="x", pady=12)
-        ttk.Button(side, text="CSV 가져오기", command=self.import_csv).pack(fill="x")
-        ttk.Button(side, text="CSV 내보내기", command=self.export_csv).pack(fill="x", pady=4)
+        foot = tk.Frame(root, bg=BG)
+        foot.pack(side="bottom", fill="x")
+        self.foot_var = tk.StringVar()
+        tk.Label(foot, textvariable=self.foot_var, bg=BG, fg=SUB, font=self.f_small,
+                 anchor="w").pack(fill="x", padx=PAD, pady=(2, 8))
 
-        self.bar_var = tk.StringVar()
-        ttk.Label(root, textvariable=self.bar_var, padding=(10, 4), anchor="w",
-                  relief="sunken").pack(side="bottom", fill="x")
-
-        mid = ttk.Frame(root, padding=(10, 0, 10, 6))
-        mid.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(mid, columns=[c[0] for c in COLUMNS], show="headings",
-                                 selectmode="extended")
-        for key, title, width, anchor in COLUMNS:
-            self.tree.heading(key, text=title, command=lambda k=key: self.sort_by(k))
-            self.tree.column(key, width=width, anchor=anchor, stretch=(key == "memo"))
-        self.tree.tag_configure("up", foreground="#1a7f37")
-        self.tree.tag_configure("down", foreground="#b42318")
-        scroll = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
+        body = tk.Frame(root, bg=BG)
+        body.pack(fill="both", expand=True)
+        self.canvas = c = tk.Canvas(body, bg=BG, highlightthickness=0)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=c.yview)
+        c.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
-        self.tree.pack(fill="both", expand=True)
+        c.pack(fill="both", expand=True)
+        c.bind("<Configure>", lambda _e: self.draw_later())
+        c.bind("<Motion>", self._on_motion)
+        c.bind("<Leave>", lambda _e: self._set_hover((None, None)))
+        c.bind("<ButtonPress-1>", lambda _e: setattr(self, "pressed", self.hover))
+        c.bind("<ButtonRelease-1>", self._on_click)
+        c.bind("<Button-3>", self._on_right)
+        c.bind("<MouseWheel>", lambda e: c.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        c.bind("<Button-4>", lambda _e: c.yview_scroll(-1, "units"))
+        c.bind("<Button-5>", lambda _e: c.yview_scroll(1, "units"))
+        c.configure(yscrollincrement=30)
 
-        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_buttons())
-        self.tree.bind("<Double-1>", self._on_double)
-        self.tree.bind("<Return>", lambda _e: self.connect())
-        self.tree.bind("<Delete>", lambda _e: self.delete())
-        self.tree.bind("<Button-3>", self._on_menu)
         root.bind("<F5>", lambda _e: (self.reload(), self.check_status()))
-        root.bind("<Control-f>", lambda _e: entry.focus_set())
-        root.bind("<Escape>", lambda _e: self.search_var.set(""))
+        root.bind("<Control-f>", lambda _e: self.search.focus_set())
+        self.search.bind("<Escape>", lambda _e: self.search_var.set(""))
+        self.search.bind("<Return>", self._on_enter)
 
-        self.menu = tk.Menu(root, tearoff=0)
-        self.menu.add_command(label="VNC 접속", command=self.connect)
-        self.menu.add_command(label="공유폴더 열기", command=self.open_share)
+        menu_opts = dict(tearoff=0, bg=CARD, fg=TEXT, activebackground=ACCENT,
+                         activeforeground="#ffffff", relief="flat", bd=1)
+        self.menu = tk.Menu(root, **menu_opts)
+        self.menu.add_command(label="VNC 접속", command=lambda: self.connect(self.menu_target))
+        self.menu.add_command(label="공유폴더 열기", command=lambda: self.open_share(self.menu_target))
+        self.menu.add_command(label="IP 복사", command=lambda: self.copy_ip(self.menu_target))
         self.menu.add_separator()
-        self.menu.add_command(label="IP 복사", command=self.copy_ip)
-        self.menu.add_command(label="수정", command=self.edit)
-        self.menu.add_command(label="삭제", command=self.delete)
+        self.menu.add_command(label="수정", command=lambda: self.edit(self.menu_target))
+        self.menu.add_command(label="삭제", command=lambda: self.delete(self.menu_target))
+        self.more_menu = tk.Menu(root, **menu_opts)
+        self.more_menu.add_command(label="CSV 가져오기", command=self.import_csv)
+        self.more_menu.add_command(label="CSV 내보내기", command=self.export_csv)
+        self.more_menu.add_separator()
+        self.more_menu.add_command(label="설정", command=self.open_settings)
+
+    def _show_more(self):
+        b = self.more_btn
+        self.more_menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 2)
+
+    # ------------------------------------------------------ 그룹 칩 ---
+
+    def _groups(self) -> list[tuple[str, int]]:
+        counts: dict[str, int] = {}
+        for e in self.items:
+            counts[e.group] = counts.get(e.group, 0) + 1
+        named = sorted((g for g in counts if g), key=natural_key)
+        out = [(ALL_GROUPS, len(self.items))] + [(g, counts[g]) for g in named]
+        if "" in counts and named:
+            out.append((NO_GROUP, counts[""]))
+        return out
+
+    def _draw_chips(self):
+        c = self.chips
+        c.delete("all")
+        groups = self._groups()
+        if len(groups) <= 1:
+            c.configure(height=1)
+            return
+        width = max(c.winfo_width(), 200)
+        x = y = 0
+        for name, count in groups:
+            label = f"{name}  {count}"
+            w = self.f_body.measure(label) + 26
+            if x and x + w > width:
+                x, y = 0, y + 36
+            on = name == self.group
+            tag = f"chip:{name}"
+            round_rect(c, x, y + 1, x + w, y + 31, 15, fill=ACCENT if on else SOFT, tags=(tag,))
+            c.create_text(x + w / 2, y + 16, text=label, font=self.f_body,
+                          fill="#ffffff" if on else TEXT, tags=(tag,))
+            x += w + 8
+        c.configure(height=y + 32)
+
+    def _on_chip(self, _event):
+        for tag in self.chips.gettags("current"):
+            if tag.startswith("chip:"):
+                self.group = tag[5:]
+                self._draw_chips()
+                self.canvas.yview_moveto(0)
+                self.draw()
+
+    # ------------------------------------------------------ 설비 카드 ---
+
+    def visible(self) -> list[Equipment]:
+        words = self.search_var.get().casefold().split()
+        out = []
+        for e in self.items:
+            if self.group != ALL_GROUPS and (e.group or NO_GROUP) != self.group:
+                continue
+            hay = " ".join((e.name, e.group, e.host, e.os, e.memo)).casefold()
+            if all(w in hay for w in words):
+                out.append(e)
+        out.sort(key=lambda e: natural_key(e.name))
+        return out
+
+    def draw_later(self):
+        if self._draw_job:
+            self.root.after_cancel(self._draw_job)
+        self._draw_job = self.root.after(30, self.draw)
+
+    def _fit(self, text: str, font: tkfont.Font, width: float) -> str:
+        if font.measure(text) <= width:
+            return text
+        while text and font.measure(text + "…") > width:
+            text = text[:-1]
+        return text + "…"
+
+    def draw(self):
+        self._draw_job = None
+        c = self.canvas
+        c.delete("all")
+        self.hover = (None, None)
+        width = max(c.winfo_width(), 300)
+        shown = self.visible()
+        up = sum(1 for e in self.items if self.status.get(e.id) is True)
+        self.summary["text"] = f"전체 {len(self.items)}대  ·  접속 가능 {up}대"
+        if not self._toast_job:
+            self.foot_var.set(f"설비 목록: {self.store.path}")
+
+        if not shown:
+            if self.items:
+                title, hint = "조건에 맞는 설비가 없습니다", "검색어를 지우거나 다른 그룹을 선택하세요"
+            else:
+                title, hint = "등록된 설비가 없습니다", "[＋ 설비 추가] 또는 [더보기 > CSV 가져오기]로 설비를 등록하세요"
+            c.create_text(width / 2, 120, text=title, font=self.f_title, fill=SUB)
+            c.create_text(width / 2, 152, text=hint, font=self.f_body, fill=SUB)
+            c.configure(scrollregion=(0, 0, width, 300))
+            return
+
+        sections: dict[str, list[Equipment]] = {}
+        for e in shown:
+            sections.setdefault(e.group, []).append(e)
+        names = sorted((g for g in sections if g), key=natural_key) + ([""] if "" in sections else [])
+        headers = bool(names and names[0])
+        cols = max(1, int((width - 2 * PAD + GAP) // (TILE_MIN_W + GAP)))
+        tile_w = (width - 2 * PAD - GAP * (cols - 1)) / cols
+        y = PAD
+        for g in names:
+            group_items = sections[g]
+            if headers:
+                c.create_text(PAD + 2, y + 8, anchor="w", text=g or NO_GROUP, font=self.f_group, fill=TEXT)
+                c.create_text(PAD + 10 + self.f_group.measure(g or NO_GROUP), y + 8, anchor="w",
+                              text=f"{len(group_items)}대", font=self.f_small, fill=SUB)
+                y += 28
+            for i, e in enumerate(group_items):
+                self._tile(e, PAD + (i % cols) * (tile_w + GAP), y + (i // cols) * (TILE_H + GAP), tile_w)
+            rows = (len(group_items) + cols - 1) // cols
+            y += rows * (TILE_H + GAP) + 14
+        c.configure(scrollregion=(0, 0, width, y + PAD - 14))
+
+    def _tile(self, e: Equipment, x: float, y: float, w: float):
+        c = self.canvas
+        st = self.status.get(e.id)
+        tid = f"id:{e.id}"
+        body = (tid, "zone:body")
+        round_rect(c, x, y, x + w, y + TILE_H, 14, fill=CARD, outline=BORDER, width=1,
+                   tags=body + (f"card:{e.id}",))
+        c.create_oval(x + 16, y + 20, x + 26, y + 30, fill=STATUS_COLOR.get(st, IDLE), outline="", tags=body)
+        c.create_text(x + 36, y + 25, anchor="w", font=self.f_name, tags=body,
+                      fill=SUB if st is False else TEXT, text=self._fit(e.name, self.f_name, w - 36 - 44))
+        # 더보기(⋯)
+        more = (tid, "zone:more")
+        round_rect(c, x + w - 38, y + 11, x + w - 10, y + 39, 8, fill=CARD, outline="",
+                   tags=more + (f"btn:{e.id}:more",))
+        c.create_text(x + w - 24, y + 24, text="⋯", font=self.f_name, fill=SUB, tags=more)
+        # 둘째 줄: IP, 공유폴더 버튼
+        addr = e.host if e.port == 5900 else f"{e.host}:{e.port}"
+        right = x + w - 12
+        if e.os == OS_WINDOWS:
+            bw = self.f_small.measure("공유폴더") + 20
+            share = (tid, "zone:share")
+            round_rect(c, right - bw, y + 44, right, y + 68, 12, fill=SOFT, outline="",
+                       tags=share + (f"btn:{e.id}:share",))
+            c.create_text(right - bw / 2, y + 56, text="공유폴더", font=self.f_small, fill=TEXT, tags=share)
+            right -= bw + 8
+        else:
+            ow = self.f_small.measure(e.os)
+            c.create_text(right, y + 56, anchor="e", text=e.os, font=self.f_small, fill=SUB, tags=body)
+            right -= ow + 8
+        word = STATUS_WORD.get(st)
+        sub = addr + (f"  ·  {word}" if word and st is not True else "")
+        if self.f_small.measure(sub) > right - (x + 36):
+            sub = addr
+        c.create_text(x + 36, y + 56, anchor="w", font=self.f_small, fill=SUB, tags=body,
+                      text=self._fit(sub, self.f_small, right - (x + 36)))
+
+    # ------------------------------------------------- 마우스, 키보드 ---
+
+    def _target(self) -> tuple[str | None, str | None]:
+        eq_id = zone = None
+        for tag in self.canvas.gettags("current"):
+            if tag.startswith("id:"):
+                eq_id = tag[3:]
+            elif tag.startswith("zone:"):
+                zone = tag[5:]
+        return eq_id, zone
+
+    def _by_id(self, eq_id) -> Equipment | None:
+        return next((e for e in self.items if e.id == eq_id), None)
+
+    def _set_hover(self, new):
+        old = self.hover
+        if new == old:
+            return
+        c = self.canvas
+        if old[0]:
+            c.itemconfigure(f"card:{old[0]}", fill=CARD, outline=BORDER, width=1)
+            c.itemconfigure(f"btn:{old[0]}:more", fill=CARD)
+            c.itemconfigure(f"btn:{old[0]}:share", fill=SOFT)
+        if new[0]:
+            c.itemconfigure(f"card:{new[0]}", fill=CARD_HOVER, outline=ACCENT, width=2)
+            c.itemconfigure(f"btn:{new[0]}:more", fill=SOFT_HOVER if new[1] == "more" else CARD_HOVER)
+            c.itemconfigure(f"btn:{new[0]}:share", fill="#c9d8ee" if new[1] == "share" else SOFT_HOVER)
+        c.configure(cursor="hand2" if new[0] else "")
+        self.hover = new
+
+    def _on_motion(self, _event):
+        self._set_hover(self._target())
+
+    def _on_click(self, event):
+        eq_id, zone = self._target()
+        if not eq_id or (eq_id, zone) != self.pressed:
+            return
+        eq = self._by_id(eq_id)
+        if not eq:
+            return
+        if zone == "share":
+            self.open_share(eq)
+        elif zone == "more":
+            self._popup(eq, event)
+        else:
+            self.connect(eq)
+
+    def _on_right(self, event):
+        eq = self._by_id(self._target()[0])
+        if eq:
+            self._popup(eq, event)
+
+    def _popup(self, eq: Equipment, event):
+        self.menu_target = eq
+        self.menu.entryconfigure(1, state="normal" if eq.os == OS_WINDOWS else "disabled")
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_enter(self, _event):
+        shown = self.visible()
+        if len(shown) == 1:
+            self.connect(shown[0])
+        elif shown:
+            self.toast(f"설비 {len(shown)}대가 보입니다. 한 대만 남도록 검색하면 Enter로 바로 접속합니다.")
+
+    def toast(self, text: str):
+        if self._toast_job:
+            self.root.after_cancel(self._toast_job)
+        self.foot_var.set(text)
+        self._toast_job = self.root.after(4000, self._toast_done)
+
+    def _toast_done(self):
+        self._toast_job = None
+        self.foot_var.set(f"설비 목록: {self.store.path}")
 
     # ---------------------------------------------------------- 데이터 ---
 
@@ -169,11 +474,10 @@ class App:
         except StoreError as e:
             messagebox.showerror(APP_NAME, str(e))
             return False
-        groups = sorted({e.group for e in self.items if e.group})
-        self.group_box["values"] = [ALL_GROUPS] + groups
-        if self.group_var.get() not in self.group_box["values"]:
-            self.group_var.set(ALL_GROUPS)
-        self.refresh_view()
+        if self.group not in [g for g, _n in self._groups()]:
+            self.group = ALL_GROUPS
+        self._draw_chips()
+        self.draw()
         return True
 
     def _watch_file(self):
@@ -182,112 +486,29 @@ class App:
             self.reload()
         self.root.after(5000, self._watch_file)
 
-    def visible(self) -> list[Equipment]:
-        words = self.search_var.get().casefold().split()
-        group = self.group_var.get()
-        out = []
-        for e in self.items:
-            if group != ALL_GROUPS and e.group != group:
-                continue
-            hay = " ".join((e.name, e.group, e.host, e.os, e.memo)).casefold()
-            if all(w in hay for w in words):
-                out.append(e)
-        key = self.sort_key
-        if key == "status":
-            keyfn = lambda e: {True: 0, False: 1}.get(self.status.get(e.id), 2)
-        elif key == "port":
-            keyfn = lambda e: e.port
-        elif key == "host":
-            keyfn = lambda e: [int(p) if p.isdigit() else -1 for p in e.host.split(".")] + [e.host]
-        else:
-            keyfn = lambda e: str(getattr(e, key)).casefold()
-        try:
-            out.sort(key=keyfn, reverse=self.sort_rev)
-        except TypeError:
-            out.sort(key=lambda e: e.host, reverse=self.sort_rev)
-        return out
-
-    def refresh_view(self):
-        selected = set(self.tree.selection())
-        self.tree.delete(*self.tree.get_children())
-        shown = self.visible()
-        for e in shown:
-            st = self.status.get(e.id)
-            tag = {True: "up", False: "down"}.get(st, "")
-            share = (e.share or "(전체)") if e.os == OS_WINDOWS else ""
-            self.tree.insert("", "end", iid=e.id, tags=(tag,), values=(
-                STATUS_TEXT.get(st, "-"), e.name, e.group, e.host, e.port, e.os, share, e.memo))
-        keep = [i for i in selected if self.tree.exists(i)]
-        if keep:
-            self.tree.selection_set(keep)
-        up = sum(1 for e in self.items if self.status.get(e.id) is True)
-        self.bar_var.set(f"전체 {len(self.items)}대  |  표시 {len(shown)}대  |  접속 가능 {up}대"
-                         f"  |  목록 파일: {self.store.path}")
-        self._update_buttons()
-
-    def sort_by(self, key: str):
-        self.sort_rev = not self.sort_rev if self.sort_key == key else False
-        self.sort_key = key
-        self.refresh_view()
-
-    def selected(self) -> list[Equipment]:
-        by_id = {e.id: e for e in self.items}
-        return [by_id[i] for i in self.tree.selection() if i in by_id]
-
-    def _update_buttons(self):
-        sel = self.selected()
-        on = lambda flag: "normal" if flag else "disabled"
-        share_ok = len(sel) == 1 and sel[0].os == OS_WINDOWS
-        self.vnc_btn["state"] = on(sel)
-        self.share_btn["state"] = on(share_ok)
-        self.edit_btn["state"] = on(len(sel) == 1)
-        self.del_btn["state"] = on(sel)
-        self.menu.entryconfigure(0, state=on(sel))
-        self.menu.entryconfigure(1, state=on(share_ok))
-        self.menu.entryconfigure(3, state=on(len(sel) == 1))
-        self.menu.entryconfigure(4, state=on(len(sel) == 1))
-        self.menu.entryconfigure(5, state=on(sel))
-
-    def _on_double(self, event):
-        if self.tree.identify_region(event.x, event.y) == "cell":
-            self.connect()
-
-    def _on_menu(self, event):
-        row = self.tree.identify_row(event.y)
-        if row:
-            if row not in self.tree.selection():
-                self.tree.selection_set(row)
-            self.menu.tk_popup(event.x_root, event.y_root)
-
     # ------------------------------------------------------------ 동작 ---
 
-    def connect(self):
-        sel = self.selected()
-        if not sel:
+    def connect(self, eq: Equipment | None):
+        if not eq:
             return
-        if len(sel) > 5 and not messagebox.askyesno(
-                APP_NAME, f"설비 {len(sel)}대에 한꺼번에 접속합니다. 계속할까요?"):
-            return
-        for eq in sel:
-            try:
-                pw = self.passwords.get(eq.id) if secret.AVAILABLE else ""
-                launch(build_command(self.cfg, eq, pw))
-            except StoreError as e:
-                messagebox.showwarning(APP_NAME, str(e))
-                return
-            except OSError as e:
-                messagebox.showerror(APP_NAME, (
-                    "VNC 뷰어를 실행할 수 없습니다.\n"
-                    f"{self.cfg.viewer_path}\n\n"
-                    "[설정]에서 뷰어 실행 파일 경로가 맞는지 확인하세요.\n"
-                    f"({e})"))
-                return
+        try:
+            pw = self.passwords.get(eq.id) if secret.AVAILABLE else ""
+            launch(build_command(self.cfg, eq, pw))
+        except StoreError as e:
+            messagebox.showwarning(APP_NAME, str(e))
+        except OSError as e:
+            messagebox.showerror(APP_NAME, (
+                "VNC 뷰어를 실행할 수 없습니다.\n"
+                f"{self.cfg.viewer_path}\n\n"
+                "[더보기 > 설정]에서 뷰어 실행 파일 경로가 맞는지 확인하세요.\n"
+                f"({e})"))
+        else:
+            self.toast(f"{eq.name} ({eq.host}) VNC 접속을 시작했습니다.")
 
-    def open_share(self):
-        sel = self.selected()
-        if len(sel) != 1 or sel[0].os != OS_WINDOWS:
+    def open_share(self, eq: Equipment | None):
+        if not eq or eq.os != OS_WINDOWS:
             return
-        path = share_path(sel[0])
+        path = share_path(eq)
         if sys.platform != "win32":
             messagebox.showinfo(APP_NAME, f"Windows에서만 열 수 있습니다.\n{path}")
             return
@@ -297,25 +518,25 @@ class App:
             launch(["explorer.exe", path])
         except OSError as e:
             messagebox.showerror(APP_NAME, f"탐색기를 실행할 수 없습니다.\n{path}\n({e})")
+        else:
+            self.toast(f"{eq.name} 공유폴더를 엽니다: {path}")
 
-    def copy_ip(self):
-        sel = self.selected()
-        if sel:
+    def copy_ip(self, eq: Equipment | None):
+        if eq:
             self.root.clipboard_clear()
-            self.root.clipboard_append(sel[0].host)
+            self.root.clipboard_append(eq.host)
+            self.toast(f"IP를 복사했습니다: {eq.host}")
 
     def add(self):
-        group = self.group_var.get()
-        base = Equipment(name="", host="", group="" if group == ALL_GROUPS else group)
-        self._edit_dialog(base, is_new=True)
+        group = "" if self.group in (ALL_GROUPS, NO_GROUP) else self.group
+        self._edit_dialog(Equipment(name="", host="", group=group), is_new=True)
 
-    def edit(self):
-        sel = self.selected()
-        if len(sel) == 1:
-            self._edit_dialog(sel[0], is_new=False)
+    def edit(self, eq: Equipment | None):
+        if eq:
+            self._edit_dialog(eq, is_new=False)
 
     def _edit_dialog(self, eq: Equipment, is_new: bool):
-        groups = sorted({e.group for e in self.items if e.group})
+        groups = sorted({e.group for e in self.items if e.group}, key=natural_key)
         has_pw = secret.AVAILABLE and not is_new and self.passwords.has(eq.id)
         dlg = EquipmentDialog(self.root, eq, is_new, groups, has_pw, self.cfg.supports_password())
 
@@ -334,32 +555,27 @@ class App:
                         APP_NAME, f"설비는 저장했지만 비밀번호는 저장하지 못했습니다.\n({e})",
                         parent=dlg.top)
             self.reload()
-            if self.tree.exists(new.id):
-                self.tree.selection_set(new.id)
-                self.tree.see(new.id)
             self.check_status([new])
+            self.toast(f"{new.name} 설비를 {'추가' if is_new else '수정'}했습니다.")
             return True
 
         dlg.on_save = save
 
-    def delete(self):
-        sel = self.selected()
-        if not sel:
+    def delete(self, eq: Equipment | None):
+        if not eq or not messagebox.askyesno(
+                APP_NAME, f"설비를 목록에서 삭제할까요?\n\n{eq.name}  ({eq.host})",
+                icon="warning", default="no"):
             return
-        names = "\n".join(e.name for e in sel[:8]) + ("\n..." if len(sel) > 8 else "")
-        if not messagebox.askyesno(APP_NAME, f"설비 {len(sel)}대를 목록에서 삭제할까요?\n\n{names}",
-                                   icon="warning", default="no"):
-            return
-        ids = [e.id for e in sel]
         try:
-            self.store.delete(ids)
+            self.store.delete([eq.id])
         except StoreError as e:
             messagebox.showerror(APP_NAME, str(e))
         else:
             try:
-                self.passwords.delete(ids)
+                self.passwords.delete([eq.id])
             except OSError:
                 pass
+            self.toast(f"{eq.name} 설비를 삭제했습니다.")
         self.reload()
 
     def import_csv(self):
@@ -388,9 +604,11 @@ class App:
         if not path:
             return
         try:
-            export_csv(sorted(self.items, key=lambda e: (e.group, e.name)), path)
+            export_csv(sorted(self.items, key=lambda e: (e.group, natural_key(e.name))), path)
         except StoreError as e:
             messagebox.showerror(APP_NAME, str(e))
+        else:
+            self.toast(f"CSV로 내보냈습니다: {path}")
 
     def open_settings(self):
         dlg = SettingsDialog(self.root, self.cfg)
@@ -417,12 +635,13 @@ class App:
             return
         timeout = self.cfg.check_timeout
         for e in items:
-            self.status[e.id] = "busy"
+            if self.status.get(e.id) is None:
+                self.status[e.id] = "busy"
             self.pending += 1
             self.pool.submit(lambda e=e: self.results.put(
                 (e.id, e.host, e.port, is_reachable(e.host, e.port, timeout))))
-        self.check_btn["state"] = "disabled"
-        self.refresh_view()
+        self.check_btn.set_enabled(False, "확인 중…")
+        self.draw()
 
     def _poll_results(self):
         changed = False
@@ -435,13 +654,13 @@ class App:
             self.pending -= 1
             cur = by_id.get(eq_id)
             if cur and (cur.host, cur.port) == (host, port):
+                changed = changed or self.status.get(eq_id) != ok
                 self.status[eq_id] = ok
-                changed = True
         if changed:
-            self.refresh_view()
-        if self.pending <= 0:
+            self.draw()
+        if self.pending <= 0 and not self.check_btn.enabled:
             self.pending = 0
-            self.check_btn["state"] = "normal"
+            self.check_btn.set_enabled(True, "상태 확인")
         self.root.after(300, self._poll_results)
 
 
@@ -454,26 +673,27 @@ class _Dialog:
         top.title(title)
         top.transient(parent)
         top.resizable(False, False)
-        self.body = ttk.Frame(top, padding=14)
+        top.configure(bg=CARD)
+        self.body = ttk.Frame(top, padding=22)
         self.body.pack(fill="both", expand=True)
         self.body.columnconfigure(1, weight=1)
         self._row = 0
         top.bind("<Escape>", lambda _e: top.destroy())
 
     def field(self, label, widget, hint=""):
-        ttk.Label(self.body, text=label).grid(row=self._row, column=0, sticky="w", pady=4)
-        widget.grid(row=self._row, column=1, sticky="ew", padx=(10, 0), pady=4)
+        ttk.Label(self.body, text=label).grid(row=self._row, column=0, sticky="w", pady=6)
+        widget.grid(row=self._row, column=1, sticky="ew", padx=(14, 0), pady=6)
         self._row += 1
         if hint:
-            ttk.Label(self.body, text=hint, foreground="#666").grid(
-                row=self._row, column=1, sticky="w", padx=(10, 0))
+            ttk.Label(self.body, text=hint, foreground=SUB).grid(
+                row=self._row, column=1, sticky="w", padx=(14, 0))
             self._row += 1
 
     def buttons(self, ok_text="저장"):
         bar = ttk.Frame(self.body)
         bar.grid(row=self._row, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(bar, text="취소", command=self.top.destroy).pack(side="right")
-        ttk.Button(bar, text=ok_text, command=self.submit).pack(side="right", padx=6)
+        ttk.Button(bar, text=ok_text, style="Accent.TButton", command=self.submit).pack(side="right", padx=8)
         self.top.bind("<Return>", lambda _e: self.submit())
         self.top.update_idletasks()
         p = self.top.master
@@ -526,7 +746,7 @@ class EquipmentDialog(_Dialog):
             self.field("VNC 비밀번호", ttk.Entry(b, textvariable=self.pw, show="*"), hint)
             if has_pw:
                 ttk.Checkbutton(b, text="저장된 비밀번호 지우기", variable=self.pw_clear).grid(
-                    row=self._row, column=1, sticky="w", padx=(10, 0))
+                    row=self._row, column=1, sticky="w", padx=(14, 0))
                 self._row += 1
         os_box.bind("<<ComboboxSelected>>", lambda _e: self._sync())
         self._sync()
