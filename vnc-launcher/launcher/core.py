@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import configparser
 import csv
+import datetime
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -17,7 +20,10 @@ OS_WINDOWS = "Windows"
 OS_CHOICES = (OS_WINDOWS, "Linux", "기타")
 DEFAULT_PORT = 5900
 
-CSV_COLUMNS = ("설비명", "그룹", "IP", "포트", "OS", "공유폴더", "메모", "공유폴더사용")
+CSV_COLUMNS = ("설비명", "그룹", "IP", "포트", "OS", "공유폴더", "메모", "공유폴더사용", "주의", "RDP사용")
+CAUTION_PRESETS = ("PM 중", "점검 중", "고장", "접속 금지")
+CAUTION_MAX = 30
+BACKUP_KEEP = 14        # 날짜별 백업을 며칠치 남길지
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
 _SHARE_BAD = re.compile(r'[<>"|?*\x00-\x1f]')
@@ -44,6 +50,8 @@ class Equipment:
     share: str = ""
     memo: str = ""
     share_enabled: bool = True   # False = 이 설비에는 공유폴더 버튼을 보이지 않는다
+    caution: str = ""            # 주의 표시 (예: PM 중). 있으면 접속할 때 한 번 더 묻는다
+    rdp_enabled: bool = True     # False = 이 설비에는 원격 데스크톱 버튼을 보이지 않는다
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @classmethod
@@ -57,6 +65,8 @@ class Equipment:
             share=str(d.get("share", "")).strip(),
             memo=str(d.get("memo", "")).strip(),
             share_enabled=_to_bool(d.get("share_enabled", True)),
+            caution=" ".join(str(d.get("caution", "")).split())[:CAUTION_MAX],
+            rdp_enabled=_to_bool(d.get("rdp_enabled", True)),
             id=str(d.get("id") or uuid.uuid4().hex),
         )
 
@@ -81,6 +91,51 @@ def _to_bool(value) -> bool:
 def has_share(eq: "Equipment") -> bool:
     """공유폴더 버튼을 쓸 수 있는 설비인지."""
     return eq.os == OS_WINDOWS and eq.share_enabled
+
+
+def has_rdp(eq: "Equipment") -> bool:
+    """원격 데스크톱 버튼을 쓸 수 있는 설비인지."""
+    return eq.os == OS_WINDOWS and eq.rdp_enabled
+
+
+def rdp_command(eq: "Equipment") -> list[str]:
+    """Windows 원격 데스크톱 연결(mstsc). 계정과 비밀번호는 Windows가 직접 묻는다."""
+    return ["mstsc.exe", f"/v:{eq.host}"]
+
+
+# ------------------------------------------------------------ 편집 잠금 ---
+# 실수로 설비나 그룹을 지우는 일을 막는 장치다(보안 장치가 아니다). PIN 은 설비 목록
+# 파일에 소금 친 해시로만 남겨, 목록을 함께 쓰는 모든 PC가 같은 잠금을 따른다.
+
+PIN_MIN = 4
+
+
+def _pin_hash(pin: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, 100_000)
+
+
+def make_lock(pin: str) -> dict:
+    salt = os.urandom(16)
+    return {"salt": salt.hex(), "hash": _pin_hash(pin, salt).hex()}
+
+
+def check_pin(lock: dict | None, pin: str) -> bool:
+    if not lock:
+        return True
+    try:
+        salt, want = bytes.fromhex(lock["salt"]), bytes.fromhex(lock["hash"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(_pin_hash(pin, salt), want)
+
+
+def _valid_lock(value) -> dict | None:
+    """손상된 잠금 정보는 없는 것으로 본다 - 그대로 두면 아무도 편집할 수 없게 된다."""
+    try:
+        bytes.fromhex(value["salt"]), bytes.fromhex(value["hash"])
+        return {"salt": value["salt"], "hash": value["hash"]}
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def new_title(name: str, current: str) -> str | None:
@@ -136,9 +191,19 @@ class EquipmentStore:
     파일을 새로 읽은 뒤 그 위에 적용한다(다른 PC가 방금 추가한 설비를 덮어쓰지 않게).
     """
 
+    _KEEP = object()   # _write 에서 "잠금 정보는 그대로" 를 뜻한다
+
     def __init__(self, path: str):
         self.path = path
         self.groups: list[str] = []  # 화면에 보일 그룹 순서 (설비가 없는 빈 그룹 포함)
+        self.lock: dict | None = None  # 편집 잠금 (PIN 해시). None = 잠금 없음
+        self.today = lambda: datetime.date.today().isoformat()   # 테스트에서 바꿔 끼운다
+
+    def folder(self) -> str:
+        return os.path.dirname(os.path.abspath(self.path))
+
+    def backup_dir(self) -> str:
+        return os.path.join(self.folder(), "backup")
 
     @staticmethod
     def _merge_groups(stored, items: list[Equipment]) -> list[str]:
@@ -159,13 +224,14 @@ class EquipmentStore:
 
     def load(self) -> list[Equipment]:
         if not os.path.exists(self.path):
-            self.groups = []
+            self.groups, self.lock = [], None
             return []
         try:
             with open(self.path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             items = [Equipment.from_dict(d) for d in data["equipment"]]
             self.groups = self._merge_groups(data.get("groups") or [], items)
+            self.lock = _valid_lock(data.get("lock"))
             return items
         except OSError as e:
             raise StoreError(
@@ -179,22 +245,46 @@ class EquipmentStore:
                 f"바꾸면 직전 상태로 되돌릴 수 있습니다.\n({e})"
             ) from e
 
-    def _write(self, items: list[Equipment], groups=None) -> None:
+    def _daily_backup(self) -> None:
+        """그날 처음 바꾸기 직전의 목록을 backup/목록이름_날짜.json 으로 남기고, 오래된 것은 지운다.
+
+        백업에 실패해도 저장은 계속한다 - 백업 때문에 일을 못 하면 안 된다.
+        """
+        if not os.path.exists(self.path):
+            return
+        stem = os.path.splitext(os.path.basename(self.path))[0]
+        folder = self.backup_dir()
+        target = os.path.join(folder, f"{stem}_{self.today()}.json")
+        try:
+            if os.path.exists(target):
+                return
+            os.makedirs(folder, exist_ok=True)
+            shutil.copy2(self.path, target)
+            pattern = re.compile(re.escape(stem) + r"_\d{4}-\d{2}-\d{2}\.json")
+            dated = sorted(n for n in os.listdir(folder) if pattern.fullmatch(n))
+            for name in dated[:-BACKUP_KEEP]:
+                os.remove(os.path.join(folder, name))
+        except OSError:
+            pass
+
+    def _write(self, items: list[Equipment], groups=None, lock=_KEEP) -> None:
         groups = self._merge_groups(self.groups if groups is None else groups, items)
-        folder = os.path.dirname(os.path.abspath(self.path))
+        lock = self.lock if lock is self._KEEP else lock
         tmp = self.path + ".tmp"
         try:
-            os.makedirs(folder, exist_ok=True)
+            os.makedirs(self.folder(), exist_ok=True)
+            self._daily_backup()
             if os.path.exists(self.path):
                 shutil.copy2(self.path, self.path + ".bak")
+            data = {"version": 1, "groups": groups, "equipment": [asdict(e) for e in items]}
+            if lock:
+                data["lock"] = lock
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "groups": groups,
-                           "equipment": [asdict(e) for e in items]},
-                          f, ensure_ascii=False, indent=1)
+                json.dump(data, f, ensure_ascii=False, indent=1)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
-            self.groups = groups
+            self.groups, self.lock = groups, lock
         except OSError as e:
             raise StoreError(
                 f"설비 목록 파일에 저장할 수 없습니다.\n{self.path}\n\n"
@@ -254,6 +344,31 @@ class EquipmentStore:
                 e.group = g if g in groups else ""
         self._write(items, groups)
 
+    def set_fields(self, ids, **fields) -> int:
+        """여러 설비의 같은 항목을 한꺼번에 바꾼다 (주의 표시, 버튼 표시). 바뀐 설비 수를 돌려준다.
+
+        update() 와 달리 다른 항목은 건드리지 않으므로, 그 사이 다른 PC가 고친 내용을 덮지 않는다.
+        """
+        ids = set(ids)
+        items = self.load()
+        changed = 0
+        for e in items:
+            if e.id not in ids:
+                continue
+            new = Equipment.from_dict({**asdict(e), **fields})
+            if new != e:
+                for k in fields:
+                    setattr(e, k, getattr(new, k))
+                changed += 1
+        if changed:
+            self._write(items)
+        return changed
+
+    def set_lock(self, pin: str | None) -> None:
+        """편집 잠금 PIN 을 정한다. None 이면 잠금을 없앤다."""
+        items = self.load()
+        self._write(items, lock=make_lock(pin) if pin else None)
+
     def delete(self, ids) -> int:
         ids = set(ids)
         items = self.load()
@@ -268,6 +383,7 @@ class EquipmentStore:
         (추가 수, 수정 수, 건너뛴 줄 설명, {설비 id: 비밀번호})
         비밀번호는 목록 파일에 넣지 않고 돌려주기만 한다 - 보관은 PasswordStore 몫.
         IP 열 없이 '설비명,비밀번호'만 있는 파일은 이미 등록된 설비에 비밀번호만 붙인다.
+        이미 있는 설비는 CSV에 있는 열만 고치고, CSV에 없는 열은 그대로 둔다.
         """
         rows, has_host = read_csv(csv_path)
         items = self.load()
@@ -285,16 +401,14 @@ class EquipmentStore:
                 elif password:
                     passwords[old.id] = password
                 continue
-            eq = Equipment.from_dict(row)
+            old = by_name.get(str(row.get("name", "")).strip().casefold())
+            # 이미 있는 설비: CSV에 없는 열(또는 칸이 모자란 줄)은 기존 값을 지킨다
+            eq = Equipment.from_dict({**asdict(old), **row, "id": old.id} if old else row)
             errors = validate(eq)
             if errors:
                 problems.append(f"{line_no}번째 줄 ({eq.name or '이름 없음'}): {errors[0]}")
                 continue
-            old = by_name.get(eq.name.casefold())
             if old:
-                eq.id = old.id
-                if "share_enabled" not in row:   # 열이 없는 CSV는 기존 설정을 지킨다
-                    eq.share_enabled = old.share_enabled
                 items[items.index(old)] = eq
                 updated += 1
             else:
@@ -317,6 +431,8 @@ _CSV_KEYS = {
     "공유폴더": "share", "share": "share",
     "메모": "memo", "비고": "memo", "memo": "memo",
     "공유폴더사용": "share_enabled", "공유폴더버튼": "share_enabled",
+    "주의": "caution", "주의표시": "caution", "caution": "caution",
+    "rdp사용": "rdp_enabled", "원격데스크톱사용": "rdp_enabled", "rdp": "rdp_enabled",
     "비밀번호": "password", "vnc비밀번호": "password", "암호": "password",
     "password": "password", "pw": "password",
 }
@@ -360,7 +476,8 @@ def export_csv(items: list[Equipment], csv_path: str) -> None:
             w.writerow(CSV_COLUMNS)
             for e in items:
                 w.writerow([e.name, e.group, e.host, e.port, e.os, e.share, e.memo,
-                            "Y" if e.share_enabled else "N"])
+                            "Y" if e.share_enabled else "N", e.caution,
+                            "Y" if e.rdp_enabled else "N"])
     except OSError as e:
         raise StoreError(
             f"CSV 파일을 저장할 수 없습니다.\n{csv_path}\n\n"
@@ -436,6 +553,9 @@ class Config:
     show_share: bool = True        # 공유폴더 버튼을 화면에 보일지 (전체)
     title_with_name: bool = True   # VNC 창 제목에 설비명을 붙일지
     quiet_connect: bool = True     # 접속 도중 뜨는 상태창을 숨길지
+    show_rdp: bool = False         # 원격 데스크톱(RDP) 버튼을 화면에 보일지 (전체)
+    auto_check_minutes: int = 1    # 몇 분마다 상태를 다시 확인할지 (0 = 하지 않음)
+    connection_log: bool = True    # 접속 이력을 남길지
 
     def quiet_args(self) -> list[str]:
         if not self.quiet_connect or self.viewer_type == "custom":
@@ -521,8 +641,14 @@ def load_config(path: str) -> Config:
     cfg.show_share = _to_bool(g("ui", "show_share_button", "yes"))
     cfg.title_with_name = _to_bool(g("viewer", "title_with_name", "yes"))
     cfg.quiet_connect = _to_bool(g("viewer", "quiet_connect", "yes"))
+    cfg.show_rdp = _to_bool(g("ui", "show_rdp_button", "no"))
+    cfg.connection_log = _to_bool(g("data", "connection_log", "yes"))
     try:
         cfg.check_timeout = min(10.0, max(0.3, float(g("status", "timeout_seconds", "1.5"))))
+    except ValueError:
+        pass
+    try:
+        cfg.auto_check_minutes = min(60, max(0, int(float(g("status", "auto_check_minutes", "1")))))
     except ValueError:
         pass
     return cfg
@@ -550,16 +676,22 @@ quiet_connect = {"yes" if cfg.quiet_connect else "no"}
 ; 설비 목록 파일 위치. 비워 두면 프로그램 폴더의 equipment.json 을 씁니다.
 ; 여러 PC가 같은 목록을 쓰려면 공유 폴더 경로를 적습니다. 예: \\\\서버\\공유\\equipment.json
 equipment_file = {cfg.equipment_file}
+; 접속 이력을 설비 목록 파일과 같은 폴더에 달마다 CSV로 남길지 (yes / no)
+connection_log = {"yes" if cfg.connection_log else "no"}
 
 [ui]
 ; 설비 버튼에 공유폴더 아이콘을 보일지 (yes / no). no 로 하면 모든 설비에서 사라집니다.
 show_share_button = {"yes" if cfg.show_share else "no"}
+; Windows 설비 버튼에 원격 데스크톱(RDP) 아이콘을 보일지 (yes / no)
+show_rdp_button = {"yes" if cfg.show_rdp else "no"}
 
 [status]
 ; 프로그램을 켤 때 각 설비의 VNC 포트 응답을 확인할지 (yes / no)
 check_on_start = {"yes" if cfg.check_on_start else "no"}
 ; 설비 한 대의 응답을 기다리는 시간(초)
 timeout_seconds = {cfg.check_timeout:g}
+; 몇 분마다 상태를 다시 확인할지 (0 = 하지 않음)
+auto_check_minutes = {cfg.auto_check_minutes}
 """
     try:
         with open(path, "w", encoding="utf-8", newline="\r\n") as f:

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import queue
-import re
 import subprocess
 import sys
 import time
@@ -13,17 +12,20 @@ from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import APP_NAME, APP_VERSION, secret, wintitle
-from .core import (OS_CHOICES, OS_WINDOWS, VIEWERS, Config, Equipment,
-                   EquipmentStore, StoreError, app_dir, build_command,
-                   detect_viewer, equipment_file, export_csv, has_share, is_reachable,
-                   load_config, natural_key, save_config, share_path)
+from .core import (BACKUP_KEEP, CAUTION_MAX, CAUTION_PRESETS, OS_CHOICES, OS_WINDOWS, PIN_MIN,
+                   VIEWERS, Config, Equipment, EquipmentStore, StoreError, app_dir, build_command,
+                   check_pin, detect_viewer, equipment_file, export_csv, has_rdp, has_share,
+                   is_reachable, load_config, natural_key, rdp_command, read_csv, save_config,
+                   share_path)
+from .history import ConnectionLog
+from .local import LocalState, fit_geometry, quick_ids
 
 ALL_GROUPS = "전체"
 NO_GROUP = "그룹 없음"
 
 # 색 - 두 가지 원칙을 같이 쓴다.
-# 1) 산업용 모니터링 화면(ISA-101 계열): 바탕과 정상 상태는 무채색, 색은 "응답 없음"(빨강)과
-#    "접속 중"(파랑)에만 쓴다.
+# 1) 산업용 모니터링 화면(ISA-101 계열): 바탕과 정상 상태는 무채색, 색은 이상과 접속에만 쓴다.
+#    빨강 = 응답 없음, 주황 = 주의 표시, 파랑 = 접속 중. 색을 못 가려도 알 수 있게 모양도 다르다.
 # 2) 질감: 은회색 바탕 위에 받침판(그룹)을 깔고 그 위에 흰 버튼을 띄운다. 테두리는 머리카락 굵기,
 #    그림자는 옅게, 모서리는 받침판과 버튼이 같은 중심을 갖도록(받침판 16 = 여백 6 + 버튼 10).
 BG = "#eceef1"          # 은회색 바탕
@@ -36,7 +38,7 @@ SHADOW = "#cfd4db"      # 버튼 아래 옅은 그림자
 SHADOW_DEEP = "#b3bac4"
 TEXT = "#171c22"
 SUB = "#68727e"
-HEAD = "#1a2028"        # 떠 있는 위쪽 바
+HEAD = "#1a2028"        # 떠 있는 위쪽 바, 고른 설비의 테두리
 HEAD_FIELD = "#2a323c"
 HEAD_HOVER = "#3a4450"
 HEAD_TEXT = "#f4f5f7"
@@ -52,12 +54,22 @@ ALERT_DARK = "#a01f17"
 ALERT_BG = "#fbe6e3"
 ALERT_LINE = "#eab5b0"
 ALERT_TEXT = "#8a1c14"
+CAUTION = "#c27c0e"     # 주의 표시 (PM 중 등)
+CAUTION_BG = "#fdf3dd"
+CAUTION_LINE = "#e9c681"
+CAUTION_TEXT = "#6b4400"
 NORMAL = "#5b8a72"      # 정상: 채도를 낮춘 녹색 점
 IDLE = "#98a2ae"
 STATUS_WORD = {True: "접속 가능", False: "응답 없음", "busy": "확인 중"}
 RADIUS = 10             # 설비 버튼 모서리
 TRAY_PAD = 6            # 받침판 안쪽 여백
 TRAY_RADIUS = RADIUS + TRAY_PAD
+ICON_ZONES = ("share", "rdp")
+RELOCK_SECONDS = 30 * 60   # 편집 잠금을 푼 뒤 이만큼 편집하지 않으면 다시 잠근다
+QUICK = "q"                # 맨 위 "즐겨찾기 · 최근" 줄의 버튼 key 앞에 붙인다
+
+# 버튼의 평소 모습: (바탕, 테두리, 글자, 아이콘, 그림자, 테두리 굵기, 접속 중인지)
+BLANK = (TILE, BORDER, TEXT, IDLE, SHADOW, 1, False)
 
 
 def mix(a: str, b: str, t: float) -> str:
@@ -73,9 +85,10 @@ def ease(t: float) -> float:
     return 1 - (1 - t) ** 4
 
 
-# 설비 버튼 크기: 화면에 다 들어오도록 TILE_W_WIDE 에서 TILE_W_NARROW 까지 줄인다.
-TILE_W_WIDE, TILE_W_NARROW, TILE_H, GAP, PAD, GROUP_GAP = 176, 118, 36, 6, 16, 8
-HINT = "클릭 = VNC 접속   ·   폴더 아이콘 = 공유폴더   ·   오른쪽 클릭 = 수정 / 삭제 / 그룹 이동"
+# 설비 버튼 크기: 화면에 다 들어오도록 TILE_W_WIDE 에서 TILE_W_NARROW 까지 줄이고,
+# 그래도 넘치면 높이를 TILE_H 에서 TILE_H_COMPACT 로 낮춘다.
+TILE_W_WIDE, TILE_W_NARROW, TILE_H, TILE_H_COMPACT, GAP, PAD, GROUP_GAP = 176, 118, 36, 30, 6, 16, 8
+ICON_STEP = 26          # 버튼 안 아이콘(공유폴더·원격 데스크톱) 하나가 차지하는 폭
 
 
 def launch(cmd: list[str]) -> subprocess.Popen:
@@ -90,6 +103,27 @@ def round_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
            x2, y2 - r, x2, y2 - r, x2, y2, x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2,
            x1, y2, x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
     return c.create_polygon(pts, smooth=True, **kw)
+
+
+def island(parent, height: int, top: int, bottom: int) -> tuple[tk.Canvas, tk.Frame]:
+    """창 가장자리에 붙이지 않고 둥근 알약 모양으로 띄운 어두운 바. (바, 내용을 넣을 틀)"""
+    bar = tk.Canvas(parent, bg=BG, height=height, highlightthickness=0)
+    row = tk.Frame(bar, bg=HEAD)
+    win = bar.create_window(PAD + 20, (top + bottom) // 2, anchor="w", window=row)
+    radius = (bottom - top) // 2
+
+    def lay(event):
+        bar.delete("island")
+        for grow, color in ((3, mix(BG, "#000000", 0.03)), (2, mix(BG, "#000000", 0.06)),
+                            (1, mix(BG, "#000000", 0.10))):   # 옅게 퍼지는 그림자
+            round_rect(bar, PAD - grow, top - grow + 3, event.width - PAD + grow, bottom + grow + 3,
+                       radius + grow, fill=color, outline="", tags="island")
+        round_rect(bar, PAD, top, event.width - PAD, bottom, radius, fill=HEAD, outline="", tags="island")
+        bar.tag_lower("island")
+        bar.itemconfigure(win, width=event.width - 2 * PAD - 32)
+
+    bar.bind("<Configure>", lay)
+    return bar, row
 
 
 class PillButton(tk.Canvas):
@@ -143,6 +177,9 @@ class PillButton(tk.Canvas):
             self.command()
 
     def set_enabled(self, flag: bool, text: str | None = None):
+        if self.job:
+            self.after_cancel(self.job)
+            self.job = None
         self.enabled = flag
         self.configure(cursor="hand2" if flag else "")
         self.now = self.colors[0]
@@ -157,23 +194,40 @@ class App:
         self.items: list[Equipment] = []
         self.status: dict[str, object] = {}
         self.group = ALL_GROUPS
-        self.hover = (None, None)   # (설비 id, 영역)
+        # 설비 버튼은 key 로 구분한다: 설비 id, 맨 위 "즐겨찾기 · 최근" 줄의 버튼은 "q" + id.
+        # 같은 설비가 두 번 보여도 마우스를 올린 버튼만 반응하게 하려는 것이다.
+        self.hover = (None, None)   # (버튼 key, 영역)
         self.pressed = (None, None)
-        # 떠 있는 뷰어: {id, name, proc, started, connected}. connected=False 는 "접속 시도 중"
+        self.inst: dict[str, str] = {}     # 버튼 key -> 설비 id
+        self.order: list[str] = []         # 그룹 순서대로 그린 설비 id (Shift+클릭 범위 선택)
+        # 떠 있는 뷰어·원격 데스크톱: {id, name, host, kind, proc, started, connected}
+        # connected=False 는 "접속 시도 중"
         self.sessions: list[dict] = []
-        self.boxes: dict[str, tuple] = {}  # 접속 시도 중인 설비 버튼의 위치 (움직이는 막대용)
-        self.base: dict[str, tuple] = {}   # 설비 버튼의 평소 색 (마우스가 떠날 때 되돌린다)
+        self.boxes: dict[str, tuple] = {}  # 접속 시도 중인 버튼의 위치 (움직이는 막대용)
+        self.base: dict[str, tuple] = {}   # 버튼의 평소 모습 (마우스가 떠날 때 되돌린다)
+        self.selecting = False             # 여러 대 선택 중
+        self.selected: set[str] = set()
+        self.anchor: str | None = None     # Shift+클릭 범위의 시작
         self.pool = ThreadPoolExecutor(max_workers=16)
+        self.log_pool = ThreadPoolExecutor(max_workers=1)  # 접속 이력은 순서대로, 화면을 막지 않게
         self.results: queue.Queue = queue.Queue()
         self.pending = 0
+        self.last_check = time.monotonic()  # 마지막 상태 확인이 끝난 때
+        self.checked_at = ""                # 화면에 보일 그 시각
+        self.newly_down: list[str] = []     # 이번 확인에서 응답 없음으로 바뀐 설비
+        self.unlocked_at = 0.0              # 편집 잠금을 푼(또는 마지막으로 편집한) 때. 0 = 잠김
         self.seen_mtime = 0.0
         self.scrollable = False
         self.only_down = False   # 응답 없는 설비만 보기
         self.gen = 0             # 화면을 다시 그릴 때마다 1 증가
         self.sunk = None         # 눌려서 내려앉은 설비 버튼
         self.reveal = 0.0        # 처음 나타나는 정도 (1 이상 = 다 나타남)
+        self.normal_geometry = ""  # 최대화하기 전의 창 크기·위치
+        self.th = TILE_H           # 지금 쓰는 버튼 높이
         self._draw_job = self._toast_job = None
         self.store = EquipmentStore("")
+        self.log = ConnectionLog(app_dir())
+        self.local = LocalState(os.path.join(app_dir(), "ui_state.json"))
 
         root.title(f"{APP_NAME} v{APP_VERSION}")
         root.geometry("1180x720")
@@ -195,6 +249,11 @@ class App:
             self._save_config()
         self.passwords = secret.PasswordStore(os.path.join(app_dir(), "passwords.json"))
         self._open_store()
+        self.group = self.local.group or ALL_GROUPS
+        self._restore_window()
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Configure>", self._on_root_configure, add="+")
+        self._show_hint()
         self.reload()
         self.root.after(60, self._reveal)
         if self.cfg.check_on_start:
@@ -202,6 +261,7 @@ class App:
         self.root.after(300, self._poll_results)
         self.root.after(5000, self._watch_file)
         self.root.after(1000, self._tick_sessions)
+        self.root.after(15000, self._tick_clock)
 
     # ------------------------------------------------------------ 화면 ---
 
@@ -237,24 +297,10 @@ class App:
 
     def _build(self):
         root = self.root
-        # 위쪽 바: 창 가장자리에 붙이지 않고, 둥근 알약 모양으로 띄운다.
-        head = tk.Canvas(root, bg=BG, height=64, highlightthickness=0)
-        head.pack(fill="x")
-        row1 = tk.Frame(head, bg=HEAD)
-        island = head.create_window(PAD + 20, 33, anchor="w", window=row1)
-
-        def lay_island(event):
-            head.delete("island")
-            for grow, color in ((3, mix(BG, "#000000", 0.03)), (2, mix(BG, "#000000", 0.06)),
-                                (1, mix(BG, "#000000", 0.10))):   # 옅게 퍼지는 그림자
-                round_rect(head, PAD - grow, 11 - grow + 3, event.width - PAD + grow, 55 + grow + 3,
-                           22 + grow, fill=color, outline="", tags="island")
-            round_rect(head, PAD, 11, event.width - PAD, 55, 22, fill=HEAD, outline="", tags="island")
-            head.tag_lower("island")
-            head.itemconfigure(island, width=event.width - 2 * PAD - 32)
-
-        head.bind("<Configure>", lay_island)
         quiet = (HEAD_FIELD, HEAD_HOVER, HEAD_TEXT)
+        # 위쪽 바
+        head, row1 = island(root, 64, 11, 55)
+        head.pack(fill="x")
         self.more_btn = PillButton(row1, "더보기  ▾", self._show_more, self.f_body, quiet, HEAD)
         self.more_btn.pack(side="right")
         self.check_btn = PillButton(row1, "상태 확인", self.check_status, self.f_body, quiet, HEAD)
@@ -280,7 +326,7 @@ class App:
         self.alert_btn = PillButton(row1, "", self.toggle_only_down, self.f_group,
                                     (ALERT, ALERT_DARK, "#ffffff"), HEAD)
 
-        # 그룹 줄. 오른쪽 끝에는 지금 VNC로 접속해 있는 설비가 나온다.
+        # 그룹 줄. 오른쪽 끝에는 지금 접속해 있는 설비가 나온다.
         self.chips = tk.Canvas(root, bg=BG, height=28, highlightthickness=0)
         self.chips.pack(fill="x", padx=PAD, pady=(2, 6))
         self.chips.bind("<Configure>", lambda _e: self._draw_chips())
@@ -288,18 +334,41 @@ class App:
 
         foot = tk.Frame(root, bg=BG)
         foot.pack(side="bottom", fill="x")
-        for mark, color, word in (("▮", ACCENT, "접속 중"), ("■", ALERT, "응답 없음"),
+        for mark, color, word in (("▮", ACCENT, "접속 중"), ("▲", CAUTION, "주의"), ("■", ALERT, "응답 없음"),
                                   ("○", IDLE, "미확인"), ("●", NORMAL, "정상")):
             tk.Label(foot, text=word, bg=BG, fg=SUB, font=self.f_small).pack(side="right", padx=(0, 14))
             tk.Label(foot, text=mark, bg=BG, fg=color, font=self.f_small).pack(side="right", padx=(0, 3))
-        self.foot_var = tk.StringVar(value=HINT)
+        self.foot_var = tk.StringVar()
         tk.Label(foot, textvariable=self.foot_var, bg=BG, fg=SUB, font=self.f_small,
                  anchor="w").pack(side="left", fill="x", expand=True, padx=PAD + 4, pady=(2, 8))
 
-        body = tk.Frame(root, bg=BG)
-        body.pack(fill="both", expand=True)
-        self.canvas = c = tk.Canvas(body, bg=BG, highlightthickness=0)
-        self.scroll = ttk.Scrollbar(body, orient="vertical", command=c.yview)
+        # 여러 대 선택 중에만 보이는 바 (아래쪽, 위쪽 바와 같은 모양)
+        self.selbar, selrow = island(root, 52, 5, 45)
+        self.sel_label = tk.Label(selrow, font=self.f_group, bg=HEAD, fg=HEAD_TEXT)
+        self.sel_label.pack(side="left")
+        tk.Label(selrow, text="클릭 = 고르기·빼기    Shift+클릭 = 범위", font=self.f_small,
+                 bg=HEAD, fg=HEAD_SUB).pack(side="left", padx=(14, 0))
+        PillButton(selrow, "선택 끝내기  Esc", self.end_selection, self.f_body, quiet,
+                   HEAD).pack(side="right")
+        PillButton(selrow, "보이는 설비 모두", self.select_all_visible, self.f_body, quiet,
+                   HEAD).pack(side="right", padx=6)
+        move_btn = PillButton(selrow, "그룹 이동  ▾", None, self.f_body, quiet, HEAD)
+        caution_btn = PillButton(selrow, "주의 표시  ▾", None, self.f_body, quiet, HEAD)
+        move_btn.command = lambda: self._menu_below(move_btn, self._fill_move_menu, self.sub_move)
+        caution_btn.command = lambda: self._menu_below(caution_btn, self._fill_caution_menu,
+                                                       self.sub_caution)
+        self.sel_buttons = [
+            PillButton(selrow, "삭제", lambda: self.delete(sorted(self.selected)), self.f_body,
+                       (ALERT, ALERT_DARK, "#ffffff"), HEAD),
+            PillButton(selrow, "★ 즐겨찾기", self.favorite_selected, self.f_body, quiet, HEAD),
+            caution_btn, move_btn]
+        for b in self.sel_buttons:
+            b.pack(side="right", padx=(0, 6))
+
+        self.body = tk.Frame(root, bg=BG)
+        self.body.pack(fill="both", expand=True)
+        self.canvas = c = tk.Canvas(self.body, bg=BG, highlightthickness=0)
+        self.scroll = ttk.Scrollbar(self.body, orient="vertical", command=c.yview)
         c.configure(yscrollcommand=self.scroll.set)
         c.pack(side="left", fill="both", expand=True)
         c.bind("<Configure>", lambda _e: self.draw_later())
@@ -311,32 +380,111 @@ class App:
         c.bind("<MouseWheel>", lambda e: self._wheel(-1 if e.delta > 0 else 1))
         c.bind("<Button-4>", lambda _e: self._wheel(-1))
         c.bind("<Button-5>", lambda _e: self._wheel(1))
-        c.configure(yscrollincrement=TILE_H + GAP)
+        c.configure(yscrollincrement=TILE_H + GAP)   # draw() 가 버튼 높이에 맞춰 다시 정한다
 
         root.bind("<F5>", lambda _e: (self.reload(), self.check_status()))
         root.bind("<Control-f>", lambda _e: self.search.focus_set())
+        root.bind("<Escape>", lambda _e: self.selecting and self.end_selection())
+        root.bind("<Delete>", self._on_delete_key)
         self.search.bind("<Escape>", lambda _e: self.search_var.set(""))
         self.search.bind("<Return>", self._on_enter)
 
         self.menu_opts = dict(tearoff=0, bg=CARD, fg=TEXT, activebackground=ACCENT,
                               activeforeground="#ffffff", relief="flat", bd=1)
         self.menu = tk.Menu(root, **self.menu_opts)
-        self.move_menu = tk.Menu(self.menu, **self.menu_opts)
+        self.sub_move = tk.Menu(self.menu, **self.menu_opts)
+        self.sub_caution = tk.Menu(self.menu, **self.menu_opts)
+        self.sub_buttons = tk.Menu(self.menu, **self.menu_opts)
         self.more_menu = tk.Menu(root, **self.menu_opts)
-        self.more_menu.add_command(label="그룹 관리", command=self.open_groups)
-        self.more_menu.add_separator()
-        self.more_menu.add_command(label="CSV 가져오기 (설비 · 비밀번호)", command=self.import_csv)
-        self.more_menu.add_command(label="CSV 내보내기", command=self.export_csv)
-        self.more_menu.add_separator()
-        self.more_menu.add_command(label="설정", command=self.open_settings)
 
     def _show_more(self):
+        m = self.more_menu
+        m.delete(0, "end")
+        m.add_command(label="그룹 관리", command=self.open_groups)
+        m.add_command(label="여러 대 선택하기", command=self.start_selection)
+        m.add_separator()
+        m.add_command(label="CSV 가져오기 (설비 · 비밀번호)", command=self.import_csv)
+        m.add_command(label="CSV 내보내기", command=self.export_csv)
+        m.add_separator()
+        m.add_command(label="접속 이력 보기", command=self.open_history)
+        m.add_command(label="백업 폴더 열기", command=self.open_backups)
+        m.add_separator()
+        if self.store.lock:
+            if self.unlocked_at:
+                m.add_command(label="편집 다시 잠그기", command=self.relock)
+            else:
+                m.add_command(label="편집 잠금 풀기", command=self._can_edit)
+        m.add_command(label="편집 잠금 설정…", command=self.open_lock)
+        m.add_command(label="설정", command=self.open_settings)
         b = self.more_btn
-        self.more_menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 2)
+        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 2)
+
+    def _menu_below(self, widget, fill, menu):
+        """선택 바의 버튼 아래에 메뉴를 펼친다."""
+        if not self.selected:
+            return
+        fill(menu, sorted(self.selected))
+        menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() - 4 - menu.winfo_reqheight())
 
     def _wheel(self, step: int):
         if self.scrollable:
             self.canvas.yview_scroll(step, "units")
+
+    def _show_hint(self):
+        parts = ["클릭 = VNC 접속"]
+        if self.cfg.show_share:
+            parts.append("폴더 = 공유폴더")
+        if self.cfg.show_rdp:
+            parts.append("모니터 = 원격 데스크톱")
+        parts += ["Ctrl+클릭 = 여러 대 선택", "오른쪽 클릭 = 메뉴"]
+        self.hint = "   ·   ".join(parts)
+        self._foot()
+
+    # ------------------------------------------------------ 창 기억 ---
+
+    def _is_zoomed(self) -> bool:
+        try:
+            if self.root.state() == "zoomed":            # Windows
+                return True
+        except tk.TclError:
+            pass
+        try:
+            return bool(int(self.root.attributes("-zoomed")))   # Linux
+        except (tk.TclError, ValueError):
+            return False
+
+    def _set_zoomed(self):
+        try:
+            self.root.state("zoomed")
+        except tk.TclError:
+            try:
+                self.root.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
+
+    def _restore_window(self):
+        screen = wintitle.virtual_screen() or (
+            0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        geometry = fit_geometry(self.local.geometry, screen, (760, 420))
+        if geometry:
+            self.root.geometry(geometry)
+            self.normal_geometry = geometry
+        if self.local.zoomed:
+            self._set_zoomed()
+
+    def _on_root_configure(self, event):
+        # 최대화하지 않은 때의 크기·위치만 기억한다 - 최대화를 풀었을 때 돌아갈 자리.
+        if event.widget is self.root and self.root.state() == "normal" and not self._is_zoomed():
+            self.normal_geometry = self.root.geometry()
+
+    def close(self):
+        self.local.zoomed = self._is_zoomed()
+        self.local.geometry = self.normal_geometry or self.root.geometry()
+        self.local.group = "" if self.group == ALL_GROUPS else self.group
+        self.local.save()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.log_pool.shutdown(wait=True)   # 남은 접속 이력은 마저 쓴다
+        self.root.destroy()
 
     # ------------------------------------------------------ 그룹 칩 ---
 
@@ -350,7 +498,8 @@ class App:
         return out
 
     def _session_names(self, connected: bool) -> list[str]:
-        return list(dict.fromkeys(s["name"] for s in self.sessions if s["connected"] == connected))
+        return list(dict.fromkeys(s["name"] + (" (RDP)" if s["kind"] == "RDP" else "")
+                                  for s in self.sessions if s["connected"] == connected))
 
     @staticmethod
     def _join(names: list[str]) -> str:
@@ -377,8 +526,7 @@ class App:
             idle = "접속 중인 설비 없음"
             right -= self.f_small.measure(idle) + 8
             c.create_text(width - 4, 13, anchor="e", text=idle, font=self.f_small, fill=SUB)
-        aw = width - right
-        room = width - aw - 16
+        room = right - 16
         x = y = 0
         chips = [(f"chip:{name}", f"{name}  {count}", name == self.group)
                  for name, count in self._groups()]
@@ -420,7 +568,7 @@ class App:
                 continue
             if self.only_down and self.status.get(e.id) is not False:
                 continue
-            hay = " ".join((e.name, e.group, e.host, e.os, e.memo)).casefold()
+            hay = " ".join((e.name, e.group, e.host, e.os, e.memo, e.caution)).casefold()
             if all(w in hay for w in words):
                 out.append(e)
         out.sort(key=lambda e: natural_key(e.name))
@@ -438,19 +586,38 @@ class App:
             text = text[:-1]
         return text + "…"
 
+    def _share_on(self, e: Equipment) -> bool:
+        return self.cfg.show_share and has_share(e)
+
+    def _rdp_on(self, e: Equipment) -> bool:
+        return self.cfg.show_rdp and has_rdp(e)
+
+    def _need(self, e: Equipment) -> int:
+        """설비명이 잘리지 않으려면 필요한 버튼 폭."""
+        icons = self._share_on(e) + self._rdp_on(e)
+        return self.f_name.measure(e.name) + 26 + 8 + ICON_STEP * icons + (18 if e.caution else 0)
+
+    def _summary(self):
+        parts = [f"전체 {len(self.items)}대"]
+        if self.checked_at:
+            parts.append(f"{self.checked_at} 확인")
+        if self.store.lock and self.unlocked_at:
+            parts.append("편집 잠금 풀림")
+        self.summary["text"] = "   ·   ".join(parts)
+
     def draw(self):
         self._draw_job = None
         c = self.canvas
         c.delete("all")
         self.gen += 1                 # 진행 중이던 색 전환은 여기서 끝난다
         self.hover = (None, None)
-        self.base = {}
-        self.boxes = {}
+        self.base, self.boxes, self.inst = {}, {}, {}
+        self.order = []
         self.sunk = None
         width, height = max(c.winfo_width(), 300), max(c.winfo_height(), 100)
         shown = self.visible()
         down = sum(1 for e in self.items if self.status.get(e.id) is False)
-        self.summary["text"] = f"전체 {len(self.items)}대"
+        self._summary()
         if down or self.only_down:
             text = f"응답 없음 {down}대만 보는 중   ✕" if self.only_down else f"응답 없음  {down}대"
             if self.alert_btn.text != text:
@@ -472,55 +639,77 @@ class App:
             self._set_scroll(0, height)
             return
 
-        sections: dict[str, list[Equipment]] = {}
+        by_group: dict[str, list[Equipment]] = {}
         for e in shown:
-            sections.setdefault(e.group, []).append(e)
-        names = [g for g in self.store.groups if g in sections] + ([""] if "" in sections else [])
-        labels = bool(names and names[0])
+            by_group.setdefault(e.group, []).append(e)
+        names = [g for g in self.store.groups if g in by_group] + ([""] if "" in by_group else [])
+        self.order = [e.id for g in names for e in by_group[g]]
+        # 맨 위 "즐겨찾기 · 최근" 줄은 전체를 볼 때만 (검색·그룹·응답 없음 필터 중에는 숨긴다)
+        by_id = {e.id: e for e in self.items}
+        quick_on = (self.group == ALL_GROUPS and not self.only_down
+                    and not self.search_var.get().strip())
+        quick = lambda cols: (quick_ids(self.local.favorites, self.local.recent, by_id, cols)
+                              if quick_on else ([], 0))
+        has_quick = bool(quick(1)[0])
+        labels = has_quick or bool(names and names[0])
         # 그룹 이름은 받침판 왼쪽 칸에 둔다 - 제목 줄을 따로 쓰지 않아 세로 공간을 아낀다.
         label_w = 0
         if labels:
-            label_w = min(140, max(self.f_group.measure(g or NO_GROUP) for g in names) + 26)
+            texts = [g or NO_GROUP for g in names] + (["★ 즐겨찾기", "최근 접속 포함"] if has_quick else [])
+            label_w = min(140, max(self.f_group.measure(t) for t in texts) + 26)
         avail = width - 2 * PAD - 2 * TRAY_PAD - label_w
         cols_for = lambda tile_w: max(1, int((avail + GAP) // (tile_w + GAP)))
         top = 2
 
-        def total(cols):
-            rows = [(len(sections[g]) + cols - 1) // cols for g in names]
-            return (sum(r * (TILE_H + GAP) - GAP + 2 * TRAY_PAD for r in rows)
-                    + GROUP_GAP * (len(names) - 1) + top + 6)
+        def total(cols, th=TILE_H):
+            counts = [len(by_group[g]) for g in names] + ([len(quick(cols)[0])] if has_quick else [])
+            rows = [-(-n // cols) for n in counts]
+            return (sum(r * (th + GAP) - GAP + 2 * TRAY_PAD for r in rows)
+                    + GROUP_GAP * (len(rows) - 1) + top + 6)
 
         # 넓은 버튼부터 시작해, 스크롤 없이 들어올 때까지 한 줄의 버튼 수를 늘린다.
         # 설비명 대부분(90%)이 잘리지 않는 폭까지만 줄인다. 유난히 긴 이름 몇 개는 … 로 줄인다.
-        widths = sorted(self.f_name.measure(e.name) for e in shown)
-        need = widths[int((len(widths) - 1) * 0.9)] + 25 + 40
-        narrow = min(TILE_W_WIDE, max(TILE_W_NARROW, need))
+        # 가장 좁혀도 넘치면 버튼 높이를 낮춘다 (그래도 넘치면 그때 스크롤).
+        widths = sorted(self._need(e) for e in shown)
+        narrow = min(TILE_W_WIDE, max(TILE_W_NARROW, widths[int((len(widths) - 1) * 0.9)]))
         cols, most = cols_for(TILE_W_WIDE), cols_for(narrow)
         while cols < most and total(cols) > height:
             cols += 1
+        self.th = th = TILE_H if total(cols) <= height else TILE_H_COMPACT
+        c.configure(yscrollincrement=th + GAP)
         tile_w = (avail - GAP * (cols - 1)) / cols
+
+        trays = []   # (버튼 key 앞머리, 제목, 둘째 줄, 설비)
+        if has_quick:
+            ids, nfav = quick(cols)
+            if nfav:
+                title, sub = "★ 즐겨찾기", ("최근 접속 포함" if len(ids) > nfav else f"{nfav}대")
+            else:
+                title, sub = "최근 접속", ""
+            trays.append((QUICK, title, sub, [by_id[i] for i in ids]))
+        trays += [("", g or NO_GROUP, f"{len(by_group[g])}대", by_group[g]) for g in names]
+
         x0 = PAD + TRAY_PAD + label_w
         y = top
-        for n, g in enumerate(names):
-            group_items = sections[g]
-            rows = (len(group_items) + cols - 1) // cols
-            tray_h = rows * (TILE_H + GAP) - GAP + 2 * TRAY_PAD
-            # 처음 켤 때: 그룹이 위에서부터 차례로 떠오르며 나타난다.
+        for n, (prefix, title, sub, its) in enumerate(trays):
+            rows = -(-len(its) // cols)
+            tray_h = rows * (th + GAP) - GAP + 2 * TRAY_PAD
+            # 처음 켤 때: 받침판이 위에서부터 차례로 떠오르며 나타난다.
             a = ease((self.reveal - 0.09 * min(n, 6)) / 0.45)
             lift = (1 - a) * 10
             round_rect(c, PAD, y + lift, width - PAD, y + tray_h + lift, TRAY_RADIUS,
                        fill=mix(BG, TRAY, a), outline=mix(BG, TRAY_LINE, a))
             if labels:
-                name = g or NO_GROUP
-                ty = y + lift + TRAY_PAD + TILE_H / 2
-                c.create_text(PAD + 16, ty - (7 if rows > 1 else 0), anchor="w", font=self.f_group,
-                              fill=mix(TRAY, TEXT, a), text=self._fit(name, self.f_group, label_w - 22))
-                if rows > 1:
+                ty = y + lift + TRAY_PAD + th / 2
+                two = bool(sub) and (rows > 1 or prefix == QUICK)
+                c.create_text(PAD + 16, ty - (7 if two else 0), anchor="w", font=self.f_group,
+                              fill=mix(TRAY, TEXT, a), text=self._fit(title, self.f_group, label_w - 22))
+                if two:
                     c.create_text(PAD + 16, ty + 11, anchor="w", font=self.f_small, fill=mix(TRAY, SUB, a),
-                                  text=f"{len(group_items)}대")
-            for i, e in enumerate(group_items):
+                                  text=self._fit(sub, self.f_small, label_w - 22))
+            for i, e in enumerate(its):
                 self._tile(e, x0 + (i % cols) * (tile_w + GAP),
-                           y + lift + TRAY_PAD + (i // cols) * (TILE_H + GAP), tile_w, a)
+                           y + lift + TRAY_PAD + (i // cols) * (th + GAP), tile_w, a, prefix + e.id)
             y += tray_h + GROUP_GAP
         self._set_scroll(y - GROUP_GAP + 6, height)
 
@@ -545,42 +734,47 @@ class App:
             self.scroll.pack_forget()
             self.canvas.yview_moveto(0)
 
-    def _share_on(self, e: Equipment) -> bool:
-        return self.cfg.show_share and has_share(e)
-
-    def _tile(self, e: Equipment, x: float, y: float, w: float, a: float = 1.0):
+    def _tile(self, e: Equipment, x: float, y: float, w: float, a: float, key: str):
         c = self.canvas
+        self.inst[key] = e.id
         st = self.status.get(e.id)
-        tid = f"id:{e.id}"
-        body = (tid, "zone:body")
-        mid = y + TILE_H / 2
+        body = (f"id:{e.id}", f"inst:{key}", "zone:body")
+        th = self.th
+        mid = y + th / 2
         mine = [s for s in self.sessions if s["id"] == e.id]
         active = any(s["connected"] for s in mine)
         trying = bool(mine) and not active
-        # (바탕, 테두리, 글자, 아이콘, 그림자) - 정상은 무채색, 색은 이상(빨강)과 접속(파랑)에만
+        # (바탕, 테두리, 글자, 아이콘, 그림자) - 정상은 무채색, 색은 이상(빨강·주황)과 접속(파랑)에만
         if trying:
             look = (TRYING_BG, TRYING_LINE, ACCENT_DARK, ACCENT, mix(SHADOW, ACCENT, 0.2))
         elif active:
             look = (ACCENT, ACCENT_DARK, "#ffffff", "#ffffff", mix(SHADOW, ACCENT, 0.35))
         elif st is False:
             look = (ALERT_BG, ALERT_LINE, ALERT_TEXT, ALERT_TEXT, mix(SHADOW, ALERT, 0.15))
+        elif e.caution:
+            look = (CAUTION_BG, CAUTION_LINE, CAUTION_TEXT, CAUTION_TEXT, mix(SHADOW, CAUTION, 0.15))
         else:
             look = (TILE, BORDER, TEXT, IDLE, SHADOW)
         if a < 1:   # 나타나는 중: 받침판 색에서 제 색으로
             look = tuple(mix(TRAY, col, a) for col in look)
-        self.base[e.id] = look
         fill, outline, ink, icon, shadow = look
+        line_w = 1
+        if e.id in self.selected:   # 고른 설비: 진한 테두리 (접속 중인 파란 버튼은 흰 테두리)
+            outline, line_w = ("#ffffff" if active else HEAD), 2
+            if not active:
+                fill = mix(fill, HEAD, 0.07)
+        self.base[key] = (fill, outline, ink, icon, shadow, line_w, active)
         # 그림자는 버튼과 따로 둔다 - 버튼만 뜨고 가라앉아 깊이가 생긴다.
-        round_rect(c, x + 1, y + 2, x + w - 1, y + TILE_H + 2, RADIUS, fill=shadow, outline="",
-                   tags=(f"shadow:{e.id}",))
-        round_rect(c, x, y, x + w, y + TILE_H, RADIUS, fill=fill, outline=outline, width=1,
-                   tags=body + (f"card:{e.id}",))
+        round_rect(c, x + 1, y + 2, x + w - 1, y + th + 2, RADIUS, fill=shadow, outline="",
+                   tags=(f"shadow:{key}",))
+        round_rect(c, x, y, x + w, y + th, RADIUS, fill=fill, outline=outline, width=line_w,
+                   tags=body + (f"card:{key}",))
         # 상태 표시: 색을 못 가려도 알 수 있게 모양도 다르게 한다.
         if trying:   # 접속 시도 중: 버튼 아래쪽을 막대가 오간다 (_sweep 이 움직인다)
             c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=ACCENT, width=2, tags=body)
-            self.boxes[e.id] = (x, y, w)
-            c.create_rectangle(0, 0, 0, 0, fill=ACCENT, outline="", tags=body + (f"sweep:{e.id}",))
-            self._place_sweep(e.id)
+            self.boxes[key] = (x, y, w)
+            c.create_rectangle(0, 0, 0, 0, fill=ACCENT, outline="", tags=body + (f"sweep:{key}",))
+            self._place_sweep(key)
         elif active:
             c.create_rectangle(x + 12, mid - 6, x + 16, mid + 6, fill=ink, outline="", tags=body)
         elif st is False:
@@ -590,28 +784,46 @@ class App:
         else:
             c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=icon, width=2, tags=body)
         right = x + w - 6
-        if self._share_on(e):   # 공유폴더 버튼: 평소엔 가는 선 아이콘만, 마우스를 올리면 동그란 버튼
-            share = (tid, "zone:share")
-            c.create_oval(right - 26, mid - 13, right, mid + 13, fill=fill, outline="",
-                          tags=share + (f"btn:{e.id}",))
-            cx = right - 13
-            c.create_polygon(cx - 6, mid - 5, cx - 2, mid - 5, cx, mid - 3, cx + 6, mid - 3,
-                             cx + 6, mid + 5, cx - 6, mid + 5, fill=fill, outline=icon,
-                             tags=share + (f"ico:{e.id}",))
-            right -= 30
+        for kind, on in (("share", self._share_on(e)), ("rdp", self._rdp_on(e))):
+            if on:   # 평소엔 가는 선 아이콘만, 마우스를 올리면 동그란 버튼
+                self._icon(kind, key, e.id, right - ICON_STEP / 2, mid, fill, icon)
+                right -= ICON_STEP
+        if e.caution:   # 주의 표시: 주황 삼각형
+            cx = right - 7
+            c.create_polygon(cx, mid - 6, cx + 7, mid + 6, cx - 7, mid + 6, fill=mix(TRAY, CAUTION, a),
+                             outline="#ffffff" if active else "", tags=body)
+            right -= 18
         c.create_text(x + 26, mid, anchor="w", font=self.f_name, tags=body, fill=ink,
                       text=self._fit(e.name, self.f_name, right - (x + 26)))
 
+    def _icon(self, kind: str, key: str, eq_id: str, cx: float, mid: float, fill: str, icon: str):
+        """공유폴더(폴더)·원격 데스크톱(모니터) 아이콘. 선 모양은 ico:, 채운 모양은 icf: 태그."""
+        c = self.canvas
+        zone = (f"id:{eq_id}", f"inst:{key}", f"zone:{kind}")
+        r = min(12, self.th / 2 - 3)
+        c.create_oval(cx - r, mid - r, cx + r, mid + r, fill=fill, outline="",
+                      tags=zone + (f"btn:{key}:{kind}",))
+        line, solid = zone + (f"ico:{key}:{kind}",), zone + (f"icf:{key}:{kind}",)
+        if kind == "share":
+            c.create_polygon(cx - 6, mid - 5, cx - 2, mid - 5, cx, mid - 3, cx + 6, mid - 3,
+                             cx + 6, mid + 5, cx - 6, mid + 5, fill=fill, outline=icon, tags=line)
+        else:
+            c.create_rectangle(cx - 7, mid - 6, cx + 7, mid + 3, fill=fill, outline=icon, tags=line)
+            c.create_rectangle(cx - 1, mid + 3, cx + 1, mid + 6, fill=icon, outline="", tags=solid)
+            c.create_rectangle(cx - 4, mid + 6, cx + 4, mid + 7, fill=icon, outline="", tags=solid)
+
     # ------------------------------------------------- 마우스, 키보드 ---
 
-    def _target(self) -> tuple[str | None, str | None]:
-        eq_id = zone = None
+    def _target(self) -> tuple[str | None, str | None, str | None]:
+        key = eq_id = zone = None
         for tag in self.canvas.gettags("current"):
-            if tag.startswith("id:"):
+            if tag.startswith("inst:"):
+                key = tag[5:]
+            elif tag.startswith("id:"):
                 eq_id = tag[3:]
             elif tag.startswith("zone:"):
                 zone = tag[5:]
-        return eq_id, zone
+        return key, eq_id, zone
 
     def _by_id(self, eq_id) -> Equipment | None:
         return next((e for e in self.items if e.id == eq_id), None)
@@ -630,35 +842,40 @@ class App:
 
         step()
 
+    def _paint_icons(self, key: str, zone: str | None, hovered: bool):
+        fill, _outline, _ink, icon, _shadow, _w, active = self.base.get(key, BLANK)
+        c = self.canvas
+        for kind in ICON_ZONES:
+            if hovered and zone == kind:
+                bg, fg = ("#ffffff", ACCENT) if active else (HEAD, "#ffffff")
+            elif hovered:
+                bg, fg = fill, ("#ffffff" if active else TEXT)
+            else:
+                bg, fg = fill, icon
+            c.itemconfigure(f"btn:{key}:{kind}", fill=bg)
+            c.itemconfigure(f"ico:{key}:{kind}", fill=bg, outline=fg)
+            c.itemconfigure(f"icf:{key}:{kind}", fill=fg)
+
     def _set_hover(self, new):
         old = self.hover
         if new == old:
             return
         c = self.canvas
-        blank = (TILE, BORDER, TEXT, IDLE, SHADOW)
-        if old[0]:
-            fill, outline, _ink, icon, shadow = self.base.get(old[0], blank)
-            c.itemconfigure(f"btn:{old[0]}", fill=fill)
-            c.itemconfigure(f"ico:{old[0]}", fill=fill, outline=icon)
-            if old[0] != new[0]:   # 버튼을 떠날 때: 제자리로 내려앉는다
-                self._settle(None)
-                c.move(f"id:{old[0]}", 0, 1)
-                self._fade(f"card:{old[0]}", "outline", HEAD, outline)
-                self._fade(f"shadow:{old[0]}", "fill", SHADOW_DEEP, shadow)
+        if old[0] and old[0] != new[0]:   # 버튼을 떠날 때: 제자리로 내려앉는다
+            _fill, outline, _ink, _icon, shadow, _w, active = self.base.get(old[0], BLANK)
+            self._settle(None)
+            c.move(f"inst:{old[0]}", 0, 1)
+            self._fade(f"card:{old[0]}", "outline", "#ffffff" if active else HEAD, outline)
+            self._fade(f"shadow:{old[0]}", "fill", SHADOW_DEEP, shadow)
+            self._paint_icons(old[0], None, False)
         if new[0]:
-            fill, outline, _ink, icon, shadow = self.base.get(new[0], blank)
-            active = fill == ACCENT
+            _fill, outline, _ink, _icon, shadow, _w, active = self.base.get(new[0], BLANK)
             if old[0] != new[0]:   # 버튼에 올라갈 때: 1px 떠오르고 그림자가 짙어진다
-                c.move(f"id:{new[0]}", 0, -1)
+                c.move(f"inst:{new[0]}", 0, -1)
                 self._fade(f"card:{new[0]}", "outline", outline, "#ffffff" if active else HEAD)
                 self._fade(f"shadow:{new[0]}", "fill", shadow, SHADOW_DEEP)
             # 상태 색은 그대로 둔다 - 마우스를 올려도 상태가 가려지지 않는다.
-            if new[1] == "share":
-                on = "#ffffff" if active else HEAD
-                c.itemconfigure(f"btn:{new[0]}", fill=on)
-                c.itemconfigure(f"ico:{new[0]}", fill=on, outline=ACCENT if active else "#ffffff")
-            else:
-                c.itemconfigure(f"ico:{new[0]}", outline="#ffffff" if active else TEXT)
+            self._paint_icons(new[0], new[1], True)
         c.configure(cursor="hand2" if new[0] else "")
         self.hover = new
         self._foot()
@@ -667,23 +884,25 @@ class App:
         """누르면 버튼이 그림자 위로 내려앉는다."""
         self.pressed = self.hover
         if self.hover[0] and not self.sunk:
-            self.canvas.move(f"id:{self.hover[0]}", 0, 2)
+            self.canvas.move(f"inst:{self.hover[0]}", 0, 2)
             self.sunk = self.hover[0]
 
     def _settle(self, _event):
         if self.sunk:
-            self.canvas.move(f"id:{self.sunk}", 0, -2)
+            self.canvas.move(f"inst:{self.sunk}", 0, -2)
             self.sunk = None
 
     def _foot(self):
         """아래 한 줄: 방금 한 일 > 마우스가 올라간 설비 정보 > 사용법."""
         if self._toast_job:
             return
-        eq = self._by_id(self.hover[0])
+        eq = self._by_id(self.inst.get(self.hover[0]))
         if not eq:
-            self.foot_var.set(HINT)
+            self.foot_var.set(getattr(self, "hint", ""))
         elif self.hover[1] == "share":
             self.foot_var.set(f"{eq.name}  공유폴더 열기:  {share_path(eq)}")
+        elif self.hover[1] == "rdp":
+            self.foot_var.set(f"{eq.name}  원격 데스크톱 접속:  {eq.host}")
         else:
             st = self.status.get(eq.id)
             mine = [s for s in self.sessions if s["id"] == eq.id]
@@ -691,49 +910,127 @@ class App:
             if mine:
                 word = "접속 중" if any(s["connected"] for s in mine) else "접속 시도 중"
             parts = [eq.name, eq.host if eq.port == 5900 else f"{eq.host}:{eq.port}", eq.os,
-                     eq.group or NO_GROUP, word, eq.memo]
+                     eq.group or NO_GROUP, word, f"▲ {eq.caution}" if eq.caution else "", eq.memo]
             self.foot_var.set("   ·   ".join(p for p in parts if p))
 
     def _on_motion(self, _event):
-        self._set_hover(self._target())
+        key, _eq_id, zone = self._target()
+        self._set_hover((key, zone) if key else (None, None))
 
-    def _on_click(self, _event):
+    def _on_click(self, event):
         self._settle(None)
-        eq_id, zone = self._target()
-        if not eq_id or (eq_id, zone) != self.pressed:
+        key, eq_id, zone = self._target()
+        if not key or (key, zone) != self.pressed:
             return
         eq = self._by_id(eq_id)
-        if eq and zone == "share":
+        if not eq:
+            return
+        shift, ctrl = event.state & 0x0001, event.state & 0x0004
+        if ctrl or shift or self.selecting:   # 여러 대 선택
+            if not self.selecting:
+                self.selecting = True
+            if shift and self.anchor:
+                self._select_range(eq.id)
+            else:
+                self.selected ^= {eq.id}
+                self.anchor = eq.id
+            self._selection_changed()
+        elif zone == "share":
             self.open_share(eq)
-        elif eq:
+        elif zone == "rdp":
+            self.open_rdp(eq)
+        else:
             self.connect(eq)
 
     def _on_right(self, event):
-        eq = self._by_id(self._target()[0])
+        _key, eq_id, _zone = self._target()
+        eq = self._by_id(eq_id)
         if not eq:
             return
-        m, mv = self.menu, self.move_menu
+        if self.selecting and eq.id in self.selected and len(self.selected) > 1:
+            menu = self._bulk_menu(sorted(self.selected))
+        else:
+            menu = self._single_menu(eq)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _single_menu(self, eq: Equipment) -> tk.Menu:
+        m = self.menu
         m.delete(0, "end")
-        mv.delete(0, "end")
-        m.add_command(label=f"{eq.name}  VNC 접속", command=lambda: self.connect(eq))
+        s = self._session(eq.id, "VNC")
+        m.add_command(label=f"{eq.name}  " + ("창 앞으로 가져오기" if s and s["connected"] else "VNC 접속"),
+                      command=lambda: self.connect(eq))
+        if self._rdp_on(eq):
+            r = self._session(eq.id, "RDP")
+            m.add_command(label="원격 데스크톱 창 앞으로 가져오기" if r and r["connected"]
+                          else "원격 데스크톱(RDP) 접속", command=lambda: self.open_rdp(eq))
         if self._share_on(eq):
             m.add_command(label="공유폴더 열기", command=lambda: self.open_share(eq))
         m.add_command(label="IP 복사", command=lambda: self.copy_ip(eq))
         m.add_separator()
-        for g in self.store.groups:
-            mv.add_command(label=("✓ " if g == eq.group else "    ") + g,
-                           command=lambda g=g: self.move_to(eq, g))
-        mv.add_command(label=("✓ " if not eq.group else "    ") + NO_GROUP,
-                       command=lambda: self.move_to(eq, ""))
-        mv.add_separator()
-        mv.add_command(label="    새 그룹 만들기…", command=lambda: self.move_to_new(eq))
-        m.add_cascade(label="그룹 이동", menu=mv)
-        if eq.os == OS_WINDOWS and self.cfg.show_share:
-            m.add_command(label="공유폴더 버튼 숨기기" if eq.share_enabled else "공유폴더 버튼 보이기",
-                          command=lambda: self.toggle_share(eq))
-        m.add_command(label="수정", command=lambda: self.edit(eq))
-        m.add_command(label="삭제", command=lambda: self.delete(eq))
-        m.tk_popup(event.x_root, event.y_root)
+        fav = self.local.is_favorite(eq.id)
+        m.add_command(label="★ 즐겨찾기에서 빼기" if fav else "☆ 즐겨찾기에 넣기",
+                      command=lambda: self.set_favorite([eq.id], not fav))
+        self._fill_caution_menu(self.sub_caution, [eq.id])
+        m.add_cascade(label="주의 표시" + (f"  ({eq.caution})" if eq.caution else ""), menu=self.sub_caution)
+        m.add_separator()
+        self._fill_move_menu(self.sub_move, [eq.id])
+        m.add_cascade(label="그룹 이동", menu=self.sub_move)
+        if eq.os == OS_WINDOWS and (self.cfg.show_share or self.cfg.show_rdp):
+            self._fill_buttons_menu(self.sub_buttons, eq)
+            m.add_cascade(label="버튼 표시", menu=self.sub_buttons)
+        if secret.AVAILABLE and self.cfg.supports_password():
+            m.add_command(label="VNC 비밀번호 저장…", command=lambda: self.set_password(eq))
+        m.add_command(label="수정…", command=lambda: self.edit(eq))
+        m.add_command(label="삭제", command=lambda: self.delete([eq.id]))
+        m.add_separator()
+        m.add_command(label="여러 대 선택하기", command=lambda: self.start_selection(eq.id))
+        return m
+
+    def _bulk_menu(self, ids: list[str]) -> tk.Menu:
+        m = self.menu
+        m.delete(0, "end")
+        m.add_command(label=f"{len(ids)}대 선택됨", state="disabled")
+        m.add_separator()
+        all_fav = all(self.local.is_favorite(i) for i in ids)
+        m.add_command(label="★ 즐겨찾기에서 빼기" if all_fav else "☆ 즐겨찾기에 넣기",
+                      command=lambda: self.set_favorite(ids, not all_fav))
+        self._fill_caution_menu(self.sub_caution, ids)
+        m.add_cascade(label="주의 표시", menu=self.sub_caution)
+        self._fill_move_menu(self.sub_move, ids)
+        m.add_cascade(label="그룹 이동", menu=self.sub_move)
+        m.add_separator()
+        m.add_command(label=f"{len(ids)}대 삭제", command=lambda: self.delete(ids))
+        m.add_command(label="선택 끝내기", command=self.end_selection)
+        return m
+
+    def _fill_move_menu(self, menu: tk.Menu, ids: list[str]):
+        menu.delete(0, "end")
+        groups = {e.group for e in (self._by_id(i) for i in ids) if e}
+        for g in self.store.groups + [""]:
+            menu.add_command(label=("✓ " if groups == {g} else "    ") + (g or NO_GROUP),
+                             command=lambda g=g: self.move_to(ids, g))
+        menu.add_separator()
+        menu.add_command(label="    새 그룹 만들기…", command=lambda: self.move_to_new(ids))
+
+    def _fill_caution_menu(self, menu: tk.Menu, ids: list[str]):
+        menu.delete(0, "end")
+        current = {e.caution for e in (self._by_id(i) for i in ids) if e}
+        for text in CAUTION_PRESETS:
+            menu.add_command(label=("✓ " if current == {text} else "    ") + text,
+                             command=lambda t=text: self.set_caution(ids, t))
+        menu.add_command(label="    직접 입력…", command=lambda: self.ask_caution(ids))
+        if any(current):
+            menu.add_separator()
+            menu.add_command(label="    주의 표시 지우기", command=lambda: self.set_caution(ids, ""))
+
+    def _fill_buttons_menu(self, menu: tk.Menu, eq: Equipment):
+        menu.delete(0, "end")
+        if self.cfg.show_share:
+            menu.add_command(label=("✓ " if eq.share_enabled else "    ") + "공유폴더 버튼",
+                             command=lambda: self.set_buttons([eq.id], share_enabled=not eq.share_enabled))
+        if self.cfg.show_rdp:
+            menu.add_command(label=("✓ " if eq.rdp_enabled else "    ") + "원격 데스크톱 버튼",
+                             command=lambda: self.set_buttons([eq.id], rdp_enabled=not eq.rdp_enabled))
 
     def toggle_only_down(self):
         self.only_down = not self.only_down
@@ -747,6 +1044,14 @@ class App:
         elif shown:
             self.toast(f"설비 {len(shown)}대가 보입니다. 한 대만 남도록 검색하면 Enter로 바로 접속합니다.")
 
+    def _on_delete_key(self, _event):
+        try:
+            typing = isinstance(self.root.focus_get(), (tk.Entry, ttk.Entry))
+        except (KeyError, tk.TclError):
+            typing = False
+        if self.selecting and self.selected and not typing:
+            self.delete(sorted(self.selected))
+
     def toast(self, text: str):
         if self._toast_job:
             self.root.after_cancel(self._toast_job)
@@ -756,6 +1061,54 @@ class App:
     def _toast_done(self):
         self._toast_job = None
         self._foot()
+
+    # ----------------------------------------------------- 여러 대 선택 ---
+
+    def start_selection(self, eq_id: str | None = None):
+        self.selecting = True
+        if eq_id:
+            self.selected.add(eq_id)
+            self.anchor = eq_id
+        self._selection_changed()
+
+    def end_selection(self):
+        self.selecting = False
+        self.selected.clear()
+        self.anchor = None
+        self._selection_changed()
+
+    def select_all_visible(self):
+        self.selected.update(e.id for e in self.visible())
+        self._selection_changed()
+
+    def _select_range(self, eq_id: str):
+        if self.anchor in self.order and eq_id in self.order:
+            i, j = sorted((self.order.index(self.anchor), self.order.index(eq_id)))
+            self.selected.update(self.order[i:j + 1])
+        else:
+            self.selected.add(eq_id)
+        self.anchor = eq_id
+
+    def _sync_selbar(self):
+        self.selected &= {e.id for e in self.items}
+        if not self.selecting:
+            self.selbar.pack_forget()
+            return
+        n = len(self.selected)
+        self.sel_label["text"] = f"{n}대 선택" if n else "설비를 클릭해서 고르세요"
+        for b in self.sel_buttons:
+            if b.enabled != bool(n):
+                b.set_enabled(bool(n))
+        if not self.selbar.winfo_manager():
+            self.selbar.pack(side="bottom", fill="x", before=self.body)
+
+    def _selection_changed(self):
+        self._sync_selbar()
+        self.draw()
+
+    def favorite_selected(self):
+        ids = sorted(self.selected)
+        self.set_favorite(ids, not all(self.local.is_favorite(i) for i in ids))
 
     # ---------------------------------------------------------- 데이터 ---
 
@@ -769,6 +1122,7 @@ class App:
 
     def _open_store(self):
         self.store = EquipmentStore(equipment_file(self.cfg))
+        self.log = ConnectionLog(self.store.folder())
 
     def reload(self) -> bool:
         self.seen_mtime = self.store.mtime()
@@ -779,6 +1133,7 @@ class App:
             return False
         if self.group not in [g for g, _n in self._groups()]:
             self.group = ALL_GROUPS
+        self._sync_selbar()
         self._draw_chips()
         self.draw()
         return True
@@ -789,10 +1144,110 @@ class App:
             self.reload()
         self.root.after(5000, self._watch_file)
 
+    def _write_log(self, action: str, name: str, host: str, note: str = ""):
+        if self.cfg.connection_log:
+            self.log_pool.submit(self.log.write, action, name, host, note)
+
+    # -------------------------------------------------------- 편집 잠금 ---
+
+    def _can_edit(self) -> bool:
+        """설비 목록을 바꿔도 되는지. 잠겨 있으면 PIN 을 묻는다."""
+        if not self.store.lock:
+            return True
+        if self.unlocked_at:
+            self.unlocked_at = time.monotonic()   # 편집하는 동안은 다시 잠기지 않는다
+            return True
+        pin = simpledialog.askstring("편집 잠금", "설비 목록이 잠겨 있습니다.\n관리자 PIN을 입력하세요.",
+                                     show="*", parent=self.root)
+        if pin is None:
+            return False
+        if not check_pin(self.store.lock, pin):
+            messagebox.showwarning(APP_NAME, "PIN이 맞지 않습니다.")
+            return False
+        self.unlocked_at = time.monotonic()
+        self._summary()
+        self.toast(f"편집 잠금을 풀었습니다. {RELOCK_SECONDS // 60}분 동안 편집하지 않으면 다시 잠깁니다.")
+        return True
+
+    def relock(self):
+        self.unlocked_at = 0.0
+        self._summary()
+        self.toast("편집을 다시 잠갔습니다.")
+
+    def open_lock(self):
+        has_lock = bool(self.store.lock)
+        dlg = LockDialog(self.root, has_lock)
+
+        def save(current: str, new: str | None) -> bool:
+            if has_lock and not check_pin(self.store.lock, current):
+                messagebox.showwarning(APP_NAME, "지금 PIN이 맞지 않습니다.", parent=dlg.top)
+                return False
+            try:
+                self.store.set_lock(new)
+            except StoreError as e:
+                messagebox.showerror(APP_NAME, str(e), parent=dlg.top)
+                return False
+            self.unlocked_at = 0.0
+            self.reload()
+            self.toast("편집 잠금을 껐습니다." if new is None else
+                       "편집 잠금을 걸었습니다. 설비 추가·수정·삭제와 그룹 변경 때 PIN을 묻습니다.")
+            return True
+
+        dlg.on_save = save
+
+    def _tick_clock(self):
+        """15초마다: 오래 편집하지 않았으면 다시 잠그고, 때가 되면 상태를 다시 확인한다."""
+        now = time.monotonic()
+        if self.unlocked_at and now - self.unlocked_at > RELOCK_SECONDS:
+            self.unlocked_at = 0.0
+            self._summary()
+            self.toast(f"{RELOCK_SECONDS // 60}분 동안 편집하지 않아 편집을 다시 잠갔습니다.")
+        minutes = self.cfg.auto_check_minutes
+        if minutes and self.items and self.pending == 0 and now - self.last_check >= minutes * 60 - 1:
+            self.check_status(quiet=True)
+        self.root.after(15000, self._tick_clock)
+
     # ------------------------------------------------------------ 동작 ---
 
+    def _session(self, eq_id: str, kind: str) -> dict | None:
+        return next((s for s in self.sessions if s["id"] == eq_id and s["kind"] == kind), None)
+
+    def _reuse(self, eq: Equipment, kind: str) -> bool:
+        """이미 떠 있는 창이 있으면 그 창을 앞으로 가져온다. True = 새로 접속하지 않는다."""
+        s = self._session(eq.id, kind)
+        if not s:
+            return False
+        if not s["connected"]:
+            self.toast(f"{eq.name}: 접속 시도 중입니다. 잠시 기다려 주세요.")
+            return True
+        if wintitle.focus(s["proc"].pid):
+            self.toast(f"{eq.name} {kind} 창을 앞으로 가져왔습니다.")
+            return True
+        return not messagebox.askyesno(
+            APP_NAME, f"{eq.name}에 이미 {kind}로 접속해 있지만 창을 찾지 못했습니다.\n\n"
+                      "새로 한 번 더 접속할까요?")
+
+    def _confirm_caution(self, eq: Equipment) -> bool:
+        if not eq.caution:
+            return True
+        return messagebox.askyesno(
+            APP_NAME, f"{eq.name} 설비에 주의 표시가 있습니다.\n\n      ▲  {eq.caution}\n\n그래도 접속할까요?",
+            icon="warning", default="no")
+
+    def _started(self, eq: Equipment, kind: str, proc: subprocess.Popen):
+        first = not any(not s["connected"] for s in self.sessions)
+        self.sessions.append({"id": eq.id, "name": eq.name, "host": eq.host, "kind": kind,
+                              "proc": proc, "started": time.monotonic(), "connected": False})
+        self.local.touch(eq.id)
+        self.local.save()
+        self._write_log(f"{kind} 접속", eq.name, eq.host)
+        self._show_sessions()
+        self.draw()
+        if first:
+            self._sweep()
+
     def connect(self, eq: Equipment | None):
-        if not eq:
+        if not eq or self._reuse(eq, "VNC") or not self._confirm_caution(eq):
             return
         try:
             pw = self.passwords.get(eq.id) if secret.AVAILABLE else ""
@@ -806,28 +1261,42 @@ class App:
                 "[더보기 > 설정]에서 뷰어 실행 파일 경로가 맞는지 확인하세요.\n"
                 f"({e})"))
         else:
-            first = not any(not s["connected"] for s in self.sessions)
-            self.sessions.append({"id": eq.id, "name": eq.name, "proc": proc,
-                                  "started": time.monotonic(), "connected": False})
-            self._show_sessions()
-            self.draw()
-            if first:
-                self._sweep()
+            self._started(eq, "VNC", proc)
             if secret.AVAILABLE and self.cfg.supports_password() and not pw:
                 self.toast(f"{eq.name}: 저장된 비밀번호가 없어 뷰어가 비밀번호를 묻습니다. "
-                           "(오른쪽 클릭 > 수정, 또는 CSV 가져오기로 저장)")
+                           "(오른쪽 클릭 > VNC 비밀번호 저장)")
             else:
                 self.toast(f"{eq.name} ({eq.host}) 접속 시도 중…")
 
+    def open_rdp(self, eq: Equipment | None):
+        if not eq or not self._rdp_on(eq):
+            return
+        if sys.platform != "win32":
+            messagebox.showinfo(APP_NAME, f"Windows에서만 열 수 있습니다.\n{' '.join(rdp_command(eq))}")
+            return
+        if self._reuse(eq, "RDP") or not self._confirm_caution(eq):
+            return
+        try:
+            proc = launch(rdp_command(eq))
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"원격 데스크톱 연결을 실행할 수 없습니다.\n({e})")
+        else:
+            self._started(eq, "RDP", proc)
+            self.toast(f"{eq.name} ({eq.host}) 원격 데스크톱 접속 시도 중… 계정은 Windows가 묻습니다.")
+
     def _tick_sessions(self):
-        """뷰어 상태를 살핀다: 창이 떴는지(접속 시도 중 -> 접속 중), 닫혔는지. 창 제목에 설비명도 붙인다."""
+        """창 상태를 살핀다: 창이 떴는지(접속 시도 중 -> 접속 중), 닫혔는지. 창 제목에 설비명도 붙인다."""
         changed = False
         alive = []
         for s in self.sessions:
-            if s["proc"].poll() is not None:       # 뷰어가 닫힘 (접속 실패 포함)
+            if s["proc"].poll() is not None:       # 창이 닫힘 (접속 실패 포함)
                 changed = True
                 if not s["connected"]:
-                    self.toast(f"{s['name']}: 접속하지 못했습니다. (뷰어가 바로 닫혔습니다)")
+                    self.toast(f"{s['name']}: 접속하지 못했습니다. ({s['kind']} 창이 뜨기 전에 닫혔습니다)")
+                    self._write_log(f"{s['kind']} 실패", s["name"], s["host"], "창이 뜨기 전에 닫힘")
+                else:
+                    minutes = round((time.monotonic() - s["started"]) / 60)
+                    self._write_log(f"{s['kind']} 종료", s["name"], s["host"], f"{minutes}분")
                 continue
             alive.append(s)
             windows = 0
@@ -837,7 +1306,7 @@ class App:
                 pass
             if not s["connected"]:
                 waited = time.monotonic() - s["started"]
-                # 뷰어 창이 화면에 나타나면 시도가 끝난 것으로 본다. 창을 살필 수 없는 경우를
+                # 창이 화면에 나타나면 시도가 끝난 것으로 본다. 창을 살필 수 없는 경우를
                 # 위해 시간 제한도 둔다.
                 if windows or waited > (20 if wintitle.AVAILABLE else 2.5):
                     s["connected"] = True
@@ -849,9 +1318,9 @@ class App:
         trying = any(not s["connected"] for s in alive)
         self.root.after(250 if trying else 1000, self._tick_sessions)
 
-    def _place_sweep(self, eq_id: str):
+    def _place_sweep(self, key: str):
         """접속 시도 중인 버튼 아래쪽에서 좌우로 오가는 막대의 지금 위치."""
-        box = self.boxes.get(eq_id)
+        box = self.boxes.get(key)
         if not box:
             return
         x, y, w = box
@@ -859,27 +1328,17 @@ class App:
         t = (time.monotonic() % 1.4) / 0.7           # 0~2: 갔다가 돌아온다
         pos = ease(t if t <= 1 else 2 - t) * (span - bar)
         left = x + RADIUS + pos
-        self.canvas.coords(f"sweep:{eq_id}", left, y + TILE_H - 4, left + bar, y + TILE_H - 2)
+        self.canvas.coords(f"sweep:{key}", left, y + self.th - 4, left + bar, y + self.th - 2)
 
     def _sweep(self):
         if not any(not s["connected"] for s in self.sessions):
             return
-        for eq_id in list(self.boxes):
-            self._place_sweep(eq_id)
+        for key in list(self.boxes):
+            self._place_sweep(key)
         self.root.after(30, self._sweep)
 
     def _show_sessions(self):
         self._draw_chips()
-
-    def toggle_share(self, eq: Equipment):
-        eq.share_enabled = not eq.share_enabled
-        try:
-            self.store.update(eq)
-        except StoreError as e:
-            messagebox.showwarning(APP_NAME, str(e))
-        else:
-            self.toast(f"{eq.name} 공유폴더 버튼을 {'보이게' if eq.share_enabled else '숨기게'} 했습니다.")
-        self.reload()
 
     def open_share(self, eq: Equipment | None):
         if not eq or not self._share_on(eq):
@@ -895,6 +1354,7 @@ class App:
         except OSError as e:
             messagebox.showerror(APP_NAME, f"탐색기를 실행할 수 없습니다.\n{path}\n({e})")
         else:
+            self._write_log("공유폴더 열기", eq.name, eq.host, path)
             self.toast(f"{eq.name} 공유폴더를 엽니다: {path}")
 
     def copy_ip(self, eq: Equipment | None):
@@ -903,22 +1363,87 @@ class App:
             self.root.clipboard_append(eq.host)
             self.toast(f"IP를 복사했습니다: {eq.host}")
 
-    def move_to(self, eq: Equipment, group: str):
+    def _what(self, ids: list[str]) -> str:
+        """토스트에 쓸 대상 이름: 한 대면 설비명, 여러 대면 "N대"."""
+        if len(ids) == 1:
+            e = self._by_id(ids[0])
+            return f"{e.name} 설비를" if e else "설비를"
+        return f"설비 {len(ids)}대를"
+
+    def set_favorite(self, ids: list[str], on: bool):
+        if self.local.set_favorite(ids, on):
+            self.local.save()
+            self.toast(f"{self._what(ids)} 즐겨찾기에 {'넣었' if on else '뺐'}습니다.")
+        self.draw()
+
+    def set_caution(self, ids: list[str], text: str):
+        """주의 표시는 PIN 없이 바꿀 수 있다 - 현장 상황을 알리는 표시라서."""
         try:
-            moved = self.store.move([eq.id], group)
+            changed = self.store.set_fields(ids, caution=text)
+        except StoreError as e:
+            messagebox.showerror(APP_NAME, str(e))
+        else:
+            if changed:
+                self.toast(f"{self._what(ids)} " + (f"'▲ {text}'(으)로 표시했습니다." if text
+                                                    else "주의 표시에서 뺐습니다."))
+        self.reload()
+
+    def ask_caution(self, ids: list[str]):
+        current = {e.caution for e in (self._by_id(i) for i in ids) if e}
+        text = simpledialog.askstring(
+            "주의 표시", f"설비 버튼에 표시하고, 접속할 때 한 번 더 물을 내용\n(최대 {CAUTION_MAX}자, 비우면 지웁니다)",
+            initialvalue=current.pop() if len(current) == 1 else "", parent=self.root)
+        if text is not None:
+            self.set_caution(ids, text.strip())
+
+    def set_buttons(self, ids: list[str], **fields):
+        if not self._can_edit():
+            return
+        try:
+            self.store.set_fields(ids, **fields)
+        except StoreError as e:
+            messagebox.showwarning(APP_NAME, str(e))
+        else:
+            what = "공유폴더" if "share_enabled" in fields else "원격 데스크톱"
+            shown = next(iter(fields.values()))
+            self.toast(f"{self._what(ids)} {what} 버튼을 {'보이게' if shown else '숨기게'} 했습니다.")
+        self.reload()
+
+    def set_password(self, eq: Equipment):
+        pw = simpledialog.askstring(
+            "VNC 비밀번호", f"{eq.name} 의 VNC 비밀번호\n이 PC에만 암호화해 저장합니다. 비워 두면 저장된 것을 지웁니다.",
+            show="*", parent=self.root)
+        if pw is None:
+            return
+        try:
+            self.passwords.set(eq.id, pw)
+        except OSError as e:
+            messagebox.showwarning(APP_NAME, f"비밀번호를 저장하지 못했습니다.\n({e})")
+            return
+        self.toast(f"{eq.name} 비밀번호를 저장했습니다." if pw else f"{eq.name} 비밀번호를 지웠습니다.")
+
+    def move_to(self, ids: list[str], group: str):
+        if not self._can_edit():
+            return
+        try:
+            moved = self.store.move(ids, group)
         except StoreError as e:
             messagebox.showerror(APP_NAME, str(e))
         else:
             if moved:
-                self.toast(f"{eq.name} 설비를 '{group or NO_GROUP}'(으)로 옮겼습니다.")
+                self.toast(f"{self._what(ids)} '{group or NO_GROUP}'(으)로 옮겼습니다.")
         self.reload()
 
-    def move_to_new(self, eq: Equipment):
+    def move_to_new(self, ids: list[str]):
+        if not self._can_edit():
+            return
         name = ask_group_name(self.root, "새 그룹 만들기", "", self.store.groups)
         if name:
-            self.move_to(eq, name)
+            self.move_to(ids, name)
 
     def open_groups(self):
+        if not self._can_edit():
+            return
         dlg = GroupDialog(self.root, self.store.groups, self.items)
 
         def save(groups, assign):
@@ -935,11 +1460,13 @@ class App:
         dlg.on_save = save
 
     def add(self):
+        if not self._can_edit():
+            return
         group = "" if self.group in (ALL_GROUPS, NO_GROUP) else self.group
         self._edit_dialog(Equipment(name="", host="", group=group), is_new=True)
 
     def edit(self, eq: Equipment | None):
-        if eq:
+        if eq and self._can_edit():
             self._edit_dialog(eq, is_new=False)
 
     def _edit_dialog(self, eq: Equipment, is_new: bool):
@@ -968,27 +1495,43 @@ class App:
 
         dlg.on_save = save
 
-    def delete(self, eq: Equipment | None):
-        if not eq or not messagebox.askyesno(
-                APP_NAME, f"설비를 목록에서 삭제할까요?\n\n{eq.name}  ({eq.host})",
-                icon="warning", default="no"):
+    def delete(self, ids: list[str]):
+        eqs = [e for e in (self._by_id(i) for i in ids) if e]
+        if not eqs or not self._can_edit():
             return
+        if len(eqs) == 1:
+            question = f"설비를 목록에서 삭제할까요?\n\n{eqs[0].name}  ({eqs[0].host})"
+        else:
+            names = "\n".join(e.name for e in eqs[:10]) + (f"\n외 {len(eqs) - 10}대" if len(eqs) > 10 else "")
+            question = f"설비 {len(eqs)}대를 목록에서 삭제할까요?\n\n{names}"
+        if not messagebox.askyesno(APP_NAME, question, icon="warning", default="no"):
+            return
+        gone = [e.id for e in eqs]
         try:
-            self.store.delete([eq.id])
+            self.store.delete(gone)
         except StoreError as e:
             messagebox.showerror(APP_NAME, str(e))
         else:
             try:
-                self.passwords.delete([eq.id])
+                self.passwords.delete(gone)
             except OSError:
                 pass
-            self.toast(f"{eq.name} 설비를 삭제했습니다.")
+            self.local.forget(gone)
+            self.local.save()
+            self.toast(f"{self._what(gone)} 삭제했습니다. (backup 폴더에 그날 처음 상태가 남아 있습니다)")
         self.reload()
 
     def import_csv(self):
         path = filedialog.askopenfilename(title="CSV 가져오기",
                                           filetypes=[("CSV 파일", "*.csv"), ("모든 파일", "*.*")])
         if not path:
+            return
+        try:
+            changes_list = read_csv(path)[1]   # IP 열이 있으면 설비 목록을 바꾼다
+        except StoreError as e:
+            messagebox.showerror(APP_NAME, str(e))
+            return
+        if changes_list and not self._can_edit():
             return
         try:
             added, updated, problems, passwords = self.store.import_csv(path)
@@ -1033,6 +1576,37 @@ class App:
         else:
             self.toast(f"CSV로 내보냈습니다: {path}")
 
+    def _open_path(self, path: str):
+        if sys.platform != "win32":
+            messagebox.showinfo(APP_NAME, f"Windows에서만 열 수 있습니다.\n{path}")
+            return
+        try:
+            os.startfile(path)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"열 수 없습니다.\n{path}\n({e})")
+
+    def open_history(self):
+        try:
+            copy = self.log.view_copy()
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"접속 이력을 읽을 수 없습니다.\n{self.log.path()}\n({e})")
+            return
+        if copy:
+            self._open_path(copy)
+        elif not self.cfg.connection_log:
+            messagebox.showinfo(APP_NAME, "접속 이력 남기기가 꺼져 있습니다.\n[더보기 > 설정]에서 켤 수 있습니다.")
+        else:
+            messagebox.showinfo(APP_NAME, f"이번 달 접속 이력이 아직 없습니다.\n{self.log.path()}")
+
+    def open_backups(self):
+        folder = self.store.backup_dir()
+        if os.path.isdir(folder):
+            self._open_path(folder)
+        else:
+            messagebox.showinfo(APP_NAME, (
+                "아직 백업이 없습니다.\n"
+                f"설비 목록을 바꾸는 날마다 처음 바꾸기 직전 상태를 {BACKUP_KEEP}일치 남깁니다.\n{folder}"))
+
     def open_settings(self):
         dlg = SettingsDialog(self.root, self.cfg)
 
@@ -1044,6 +1618,8 @@ class App:
                 return False
             self._open_store()
             self.status.clear()
+            self.checked_at = ""
+            self._show_hint()
             if self.reload():
                 self.check_status()
             return True
@@ -1052,35 +1628,48 @@ class App:
 
     # ------------------------------------------------------- 상태 확인 ---
 
-    def check_status(self, items=None):
+    def check_status(self, items=None, quiet: bool = False):
+        """설비의 VNC 포트 응답을 확인한다. quiet = 자동 확인 (버튼과 화면을 건드리지 않는다)."""
         items = list(self.items if items is None else items)
         if not items:
             return
         timeout = self.cfg.check_timeout
         for e in items:
-            if self.status.get(e.id) is None:
+            if not quiet and self.status.get(e.id) is None:
                 self.status[e.id] = "busy"
             self.pending += 1
             self.pool.submit(lambda e=e: self.results.put(
                 (e.id, e.host, e.port, is_reachable(e.host, e.port, timeout))))
-        self.check_btn.set_enabled(False, "확인 중…")
-        self.draw()
+        if not quiet:
+            self.check_btn.set_enabled(False, "확인 중…")
+            self.draw()
 
     def _poll_results(self):
-        changed = False
+        changed = got = False
         by_id = {e.id: e for e in self.items}
         while True:
             try:
                 eq_id, host, port, ok = self.results.get_nowait()
             except queue.Empty:
                 break
+            got = True
             self.pending -= 1
             cur = by_id.get(eq_id)
             if cur and (cur.host, cur.port) == (host, port):
+                if self.status.get(eq_id) is True and ok is False:
+                    self.newly_down.append(cur.name)
                 changed = changed or self.status.get(eq_id) != ok
                 self.status[eq_id] = ok
         if changed:
             self.draw()
+        if got and self.pending <= 0:   # 한 번의 확인이 끝났다
+            self.pending = 0
+            self.last_check = time.monotonic()
+            self.checked_at = time.strftime("%H:%M")
+            self._summary()
+            if self.newly_down:
+                self.toast("응답 없음으로 바뀐 설비: " + self._join(self.newly_down))
+                self.newly_down = []
         if self.pending <= 0 and not self.check_btn.enabled:
             self.pending = 0
             self.check_btn.set_enabled(True, "상태 확인")
@@ -1144,7 +1733,9 @@ class EquipmentDialog(_Dialog):
         self.os = tk.StringVar(value=eq.os)
         self.share = tk.StringVar(value=eq.share)
         self.memo = tk.StringVar(value=eq.memo)
+        self.caution = tk.StringVar(value=eq.caution)
         self.share_on = tk.BooleanVar(value=eq.share_enabled)
+        self.rdp_on = tk.BooleanVar(value=eq.rdp_enabled)
         self.pw = tk.StringVar()
         self.pw_clear = tk.BooleanVar(value=False)
 
@@ -1159,9 +1750,15 @@ class EquipmentDialog(_Dialog):
         self.share_entry = ttk.Entry(b, textvariable=self.share)
         self.field("공유폴더", self.share_entry,
                    "예: D$ 또는 Data  (비우면 \\\\IP 의 공유 목록 전체)")
-        self.share_check = ttk.Checkbutton(b, text="이 설비에 공유폴더 버튼 보이기", variable=self.share_on,
+        row = ttk.Frame(b)
+        self.share_check = ttk.Checkbutton(row, text="공유폴더 버튼", variable=self.share_on,
                                            command=self._sync)
-        self.field("", self.share_check)
+        self.share_check.pack(side="left", padx=(0, 18))
+        self.rdp_check = ttk.Checkbutton(row, text="원격 데스크톱(RDP) 버튼", variable=self.rdp_on)
+        self.rdp_check.pack(side="left")
+        self.field("버튼 표시", row, "Windows 설비에만 해당. 전체 사용 여부는 [더보기 > 설정]")
+        self.field("주의 표시", ttk.Combobox(b, textvariable=self.caution, values=("",) + CAUTION_PRESETS),
+                   "예: PM 중. 적어 두면 버튼에 ▲ 표시가 붙고, 접속할 때 한 번 더 묻습니다")
         self.field("메모", ttk.Entry(b, textvariable=self.memo))
         if secret.AVAILABLE:
             if not pw_supported:
@@ -1183,6 +1780,7 @@ class EquipmentDialog(_Dialog):
     def _sync(self):
         is_win = self.os.get() == OS_WINDOWS
         self.share_check["state"] = "normal" if is_win else "disabled"
+        self.rdp_check["state"] = "normal" if is_win else "disabled"
         self.share_entry["state"] = "normal" if is_win and self.share_on.get() else "disabled"
 
     def submit(self):
@@ -1191,7 +1789,8 @@ class EquipmentDialog(_Dialog):
             "id": self.eq.id, "name": self.name.get(), "group": self.group.get(),
             "host": self.host.get(), "port": self.port.get() or "5900", "os": self.os.get(),
             "share": self.share.get() if is_win else "", "memo": self.memo.get(),
-            "share_enabled": self.share_on.get()})
+            "share_enabled": self.share_on.get(), "caution": self.caution.get(),
+            "rdp_enabled": self.rdp_on.get()})
         password = None  # None = 건드리지 않음
         if self.pw_clear.get():
             password = ""
@@ -1199,6 +1798,9 @@ class EquipmentDialog(_Dialog):
             password = self.pw.get()
         if self.on_save and self.on_save(new, password):
             self.top.destroy()
+
+
+AUTO_CHECK_CHOICES = {"끔": 0, "1분마다": 1, "3분마다": 3, "5분마다": 5, "10분마다": 10}
 
 
 class SettingsDialog(_Dialog):
@@ -1215,8 +1817,15 @@ class SettingsDialog(_Dialog):
         self.efile = tk.StringVar(value=cfg.equipment_file)
         self.check = tk.BooleanVar(value=cfg.check_on_start)
         self.show_share = tk.BooleanVar(value=cfg.show_share)
+        self.show_rdp = tk.BooleanVar(value=cfg.show_rdp)
         self.title_name = tk.BooleanVar(value=cfg.title_with_name)
         self.quiet = tk.BooleanVar(value=cfg.quiet_connect)
+        self.log_on = tk.BooleanVar(value=cfg.connection_log)
+        self.auto_choices = dict(AUTO_CHECK_CHOICES)
+        if cfg.auto_check_minutes not in self.auto_choices.values():   # config.ini 에 직접 적은 값
+            self.auto_choices[f"{cfg.auto_check_minutes}분마다"] = cfg.auto_check_minutes
+        self.auto = tk.StringVar(value=next(k for k, v in self.auto_choices.items()
+                                            if v == cfg.auto_check_minutes))
 
         box = ttk.Combobox(b, textvariable=self.vtype, state="readonly",
                            values=[VIEWERS[k]["label"] for k in self.keys])
@@ -1236,12 +1845,26 @@ class SettingsDialog(_Dialog):
         ttk.Button(row2, text="찾기", width=6, command=self._browse_file).pack(side="left", padx=(4, 0))
         self.field("설비 목록 파일", row2,
                    "비우면 프로그램 폴더의 equipment.json. 공유 폴더 경로를 넣으면 여러 PC가 같이 씁니다")
-        self.field("", ttk.Checkbutton(b, text="프로그램을 켤 때 설비 상태 확인", variable=self.check))
-        self.field("", ttk.Checkbutton(b, text="VNC 창 제목 표시줄에 설비명 표시", variable=self.title_name))
-        self.field("", ttk.Checkbutton(b, text="접속 도중 뜨는 상태창 숨기기", variable=self.quiet),
-                   "UltraVNC 에 적용. 비밀번호 입력창은 설비 비밀번호를 저장해 두면 뜨지 않습니다")
-        self.field("", ttk.Checkbutton(b, text="공유폴더 버튼 사용", variable=self.show_share),
-                   "끄면 모든 설비에서 사라집니다. 설비별로 끄려면 설비를 오른쪽 클릭하세요")
+
+        opts = ttk.Frame(b)
+
+        def check(text, var, r, col):
+            ttk.Checkbutton(opts, text=text, variable=var).grid(row=r, column=col, sticky="w",
+                                                                padx=(0, 28), pady=3)
+
+        check("프로그램을 켤 때 상태 확인", self.check, 0, 0)
+        auto = ttk.Frame(opts)
+        auto.grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Label(auto, text="자동 상태 확인").pack(side="left", padx=(0, 8))
+        ttk.Combobox(auto, textvariable=self.auto, values=list(self.auto_choices), state="readonly",
+                     width=9).pack(side="left")
+        check("VNC 창 제목에 설비명 표시", self.title_name, 1, 0)
+        check("접속 도중 뜨는 상태창 숨기기 (UltraVNC)", self.quiet, 1, 1)
+        check("공유폴더 버튼 사용", self.show_share, 2, 0)
+        check("원격 데스크톱(RDP) 버튼 사용", self.show_rdp, 2, 1)
+        check("접속 이력 남기기", self.log_on, 3, 0)
+        self.field("동작", opts, "설비별로 버튼을 끄려면 설비를 오른쪽 클릭 > 버튼 표시. "
+                               "비밀번호 입력창은 비밀번호를 저장해 두면 뜨지 않습니다")
         box.bind("<<ComboboxSelected>>", lambda _e: self._sync())
         self._sync()
         self.buttons()
@@ -1300,8 +1923,59 @@ class SettingsDialog(_Dialog):
             equipment_file=self.efile.get().strip().strip('"'),
             check_on_start=self.check.get(), check_timeout=self.cfg.check_timeout,
             show_share=self.show_share.get(), title_with_name=self.title_name.get(),
-            quiet_connect=self.quiet.get())
+            quiet_connect=self.quiet.get(), show_rdp=self.show_rdp.get(),
+            auto_check_minutes=self.auto_choices.get(self.auto.get(), self.cfg.auto_check_minutes),
+            connection_log=self.log_on.get())
         if self.on_save and self.on_save(cfg):
+            self.top.destroy()
+
+
+class LockDialog(_Dialog):
+    """편집 잠금 PIN 정하기·바꾸기·끄기."""
+
+    def __init__(self, parent, has_lock: bool):
+        super().__init__(parent, "편집 잠금")
+        self.has_lock = has_lock
+        b = self.body
+        self.current = tk.StringVar()
+        self.new = tk.StringVar()
+        self.again = tk.StringVar()
+        self.off = tk.BooleanVar(value=False)
+        ttk.Label(b, foreground=SUB, justify="left", text=(
+            "잠그면 설비 추가·수정·삭제, 그룹 변경, 버튼 표시 변경 때 PIN을 묻습니다.\n"
+            "접속, 주의 표시, 즐겨찾기, 비밀번호 저장은 PIN 없이 쓸 수 있습니다.\n"
+            "PIN은 설비 목록 파일에 저장되어, 목록을 함께 쓰는 모든 PC에 적용됩니다.")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self._row = 1
+        first = None
+        if has_lock:
+            first = ttk.Entry(b, textvariable=self.current, show="*", width=24)
+            self.field("지금 PIN", first)
+        self.new_entry = ttk.Entry(b, textvariable=self.new, show="*", width=24)
+        self.field("새 PIN", self.new_entry, f"{PIN_MIN}자 이상")
+        self.again_entry = ttk.Entry(b, textvariable=self.again, show="*", width=24)
+        self.field("새 PIN 확인", self.again_entry)
+        if has_lock:
+            self.field("", ttk.Checkbutton(b, text="편집 잠금 끄기", variable=self.off, command=self._sync))
+        self.buttons()
+        (first or self.new_entry).focus_set()
+
+    def _sync(self):
+        state = "disabled" if self.off.get() else "normal"
+        self.new_entry["state"] = state
+        self.again_entry["state"] = state
+
+    def submit(self):
+        off = self.off.get()
+        new = self.new.get()
+        if not off:
+            if len(new) < PIN_MIN:
+                messagebox.showwarning(APP_NAME, f"PIN은 {PIN_MIN}자 이상이어야 합니다.", parent=self.top)
+                return
+            if new != self.again.get():
+                messagebox.showwarning(APP_NAME, "새 PIN 두 칸이 서로 다릅니다.", parent=self.top)
+                return
+        if self.on_save and self.on_save(self.current.get(), None if off else new):
             self.top.destroy()
 
 

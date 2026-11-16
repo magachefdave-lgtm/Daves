@@ -247,3 +247,125 @@ def test_is_reachable():
     assert core.is_reachable("127.0.0.1", port, 1.0)
     srv.close()
     assert not core.is_reachable("127.0.0.1", port, 0.5)
+
+
+# ---------------------------------------------------------------- 주의 표시 · RDP ---
+
+def test_caution_and_rdp_fields_roundtrip(store, tmp_path):
+    store.add(eq("EQ-01", caution="  PM\n중  ", rdp_enabled=False))
+    store.add(eq("EQ-02", "10.0.0.2", os="Linux"))
+    a, b = store.load()
+    assert (a.caution, a.rdp_enabled) == ("PM 중", False)          # 줄바꿈·여백 정리
+    assert not core.has_rdp(a) and not core.has_rdp(b)              # 꺼 둠 / Linux
+    assert core.has_rdp(eq()) and core.rdp_command(eq()) == ["mstsc.exe", "/v:10.0.0.1"]
+    assert Equipment.from_dict({"name": "x", "host": "h", "caution": "가" * 99}).caution == "가" * core.CAUTION_MAX
+    out = str(tmp_path / "out.csv")
+    core.export_csv(store.load(), out)
+    other = EquipmentStore(str(tmp_path / "other.json"))
+    other.import_csv(out)
+    assert [(e.caution, e.rdp_enabled) for e in other.load()] == [("PM 중", False), ("", True)]
+
+
+def test_set_fields_changes_only_given_fields(store):
+    a, b = eq("A", memo="m"), eq("B", "10.0.0.2")
+    store.add(a)
+    store.add(b)
+    other = EquipmentStore(store.path)
+    other.load()
+    a.memo = "다른 PC가 고친 메모"
+    EquipmentStore(store.path).update(a)                        # 그 사이 다른 PC가 메모를 고침
+    assert other.set_fields([a.id, b.id], caution="PM 중") == 2
+    assert other.set_fields([a.id, b.id], caution="PM 중") == 0  # 같은 값이면 쓰지 않는다
+    got = {e.name: e for e in store.load()}
+    assert (got["A"].caution, got["A"].memo, got["B"].caution) == ("PM 중", "다른 PC가 고친 메모", "PM 중")
+    assert other.set_fields([b.id], share_enabled=False, rdp_enabled=False) == 1
+    assert not store.load()[1].share_enabled and not store.load()[1].rdp_enabled
+
+
+def test_csv_absent_columns_keep_existing_values(store, tmp_path):
+    a = eq("EQ-01", group="식각", memo="유지", caution="PM 중", share="D$", share_enabled=False)
+    store.add(a)
+    p = tmp_path / "in.csv"
+    p.write_text("설비명,IP,메모\nEQ-01,10.0.0.9,새 메모\nEQ-02,10.0.0.2\n", encoding="utf-8")
+    store.import_csv(str(p))
+    got = {e.name: e for e in store.load()}
+    e1 = got["EQ-01"]
+    assert (e1.host, e1.memo) == ("10.0.0.9", "새 메모")                       # 있는 열은 고친다
+    assert (e1.group, e1.caution, e1.share, e1.share_enabled) == ("식각", "PM 중", "D$", False)
+    assert got["EQ-02"].memo == ""                                              # 칸이 모자란 새 줄
+
+
+# ---------------------------------------------------------------- 편집 잠금 ---
+
+def test_lock_set_check_and_survives_other_writes(store):
+    store.add(eq("A"))
+    assert core.check_pin(None, "아무거나")           # 잠금이 없으면 항상 통과
+    store.set_lock("1234")
+    raw = open(store.path, encoding="utf-8").read()
+    assert "1234" not in raw and '"lock"' in raw       # PIN 자체는 남기지 않는다
+    other = EquipmentStore(store.path)
+    other.add(eq("B", "10.0.0.2"))                     # 다른 PC의 편집이 잠금을 지우지 않는다
+    other.move([other.load()[0].id], "G")
+    other.set_fields([other.load()[0].id], caution="PM 중")
+    fresh = EquipmentStore(store.path)
+    fresh.load()
+    assert core.check_pin(fresh.lock, "1234") and not core.check_pin(fresh.lock, "1235")
+    fresh.set_lock(None)
+    fresh.load()
+    assert fresh.lock is None and len(fresh.load()) == 2
+
+
+def test_broken_lock_is_ignored(store):
+    store.add(eq("A"))
+    import json
+    data = json.load(open(store.path, encoding="utf-8"))
+    data["lock"] = {"salt": "zz", "hash": 3}
+    json.dump(data, open(store.path, "w", encoding="utf-8"))
+    store.load()
+    assert store.lock is None                         # 아무도 편집 못 하게 되는 것보다 낫다
+
+
+# ---------------------------------------------------------------- 날짜별 백업 ---
+
+def test_daily_backup_once_per_day_and_pruned(store, monkeypatch):
+    day = ["2026-11-01"]
+    store.today = lambda: day[0]
+    store.add(eq("A"))                                 # 파일이 처음 생길 때는 백업할 것이 없다
+    assert not os.path.isdir(store.backup_dir())
+    store.add(eq("B", "10.0.0.2"))                     # 그날 처음 바꾸기 직전 = A 만 있는 상태
+    store.add(eq("C", "10.0.0.3"))                     # 같은 날 두 번째 변경은 백업하지 않는다
+    first = os.path.join(store.backup_dir(), "equipment_2026-11-01.json")
+    assert [e.name for e in EquipmentStore(first).load()] == ["A"]
+    for d in range(2, 2 + core.BACKUP_KEEP + 3):
+        day[0] = f"2026-11-{d:02d}"
+        store.set_fields([store.load()[0].id], memo=f"m{d}")
+    names = sorted(os.listdir(store.backup_dir()))
+    assert len(names) == core.BACKUP_KEEP
+    assert names[-1] == f"equipment_2026-11-{1 + core.BACKUP_KEEP + 3:02d}.json"
+    assert "equipment_2026-11-01.json" not in names    # 오래된 것부터 지운다
+
+
+def test_backup_failure_does_not_block_save(store, monkeypatch):
+    store.add(eq("A"))
+    monkeypatch.setattr(core.shutil, "copy2", lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
+    with pytest.raises(StoreError):                    # .bak 복사도 같은 함수를 쓰므로 막히면 오류
+        store.add(eq("B", "10.0.0.2"))
+    monkeypatch.undo()
+    real = core.shutil.copy2
+    monkeypatch.setattr(store, "backup_dir", lambda: "/proc/no-such-dir/backup")
+    store.today = lambda: "2026-12-01"
+    store.add(eq("B", "10.0.0.2"))                     # 백업 폴더를 못 만들어도 저장은 된다
+    assert [e.name for e in store.load()] == ["A", "B"]
+    assert real is core.shutil.copy2
+
+
+def test_config_new_options_roundtrip(tmp_path):
+    p = str(tmp_path / "config.ini")
+    cfg = Config(show_rdp=True, auto_check_minutes=5, connection_log=False)
+    core.save_config(cfg, p)
+    assert core.load_config(p) == cfg
+    text = open(p, encoding="utf-8").read().replace("auto_check_minutes = 5", "auto_check_minutes = 999")
+    open(p, "w", encoding="utf-8").write(text)
+    assert core.load_config(p).auto_check_minutes == 60
+    assert core.load_config(str(tmp_path / "none.ini")) == Config()     # 기본: RDP 끔, 1분, 이력 켬
+    assert (Config().show_rdp, Config().auto_check_minutes, Config().connection_log) == (False, 1, True)
