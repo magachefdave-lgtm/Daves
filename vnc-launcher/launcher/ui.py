@@ -424,6 +424,7 @@ class App:
         if not self.selected:
             return
         fill(menu, sorted(self.selected))
+        menu.update_idletasks()   # 한 번도 펼치지 않은 메뉴는 이걸 해야 높이를 안다
         menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() - 4 - menu.winfo_reqheight())
 
     def _wheel(self, step: int):
