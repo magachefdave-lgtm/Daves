@@ -1,5 +1,7 @@
 # 설비 원격 접속 (VNC 런처)
 
+<img src="assets/icon_256.png" width="96" alt="">
+
 설비 목록을 관리하고, 설치된 VNC 뷰어와 Windows 공유폴더를 버튼 하나로 여는 Windows용 프로그램.
 파이썬 표준 라이브러리(tkinter)만 사용한다.
 
@@ -16,6 +18,7 @@
 | `launcher/secret.py` | VNC 비밀번호 보관 (Windows DPAPI) |
 | `launcher/wintitle.py` | Windows 창 다루기: 뷰어 창 제목, 창 앞으로 가져오기, 화면 크기 |
 | `launcher/ui.py` | 화면 |
+| `assets/app.ico`, `launcher/icon_data.py` | 프로그램 아이콘 (`python tools/make_icon.py` 로 다시 만든다, Pillow 필요) |
 
 공유 목록(`equipment.json`)에는 설비, 그룹 순서, 주의 표시, 편집 잠금(PIN 해시)이 들어가고,
 PC마다 다른 것(`ui_state.json`, `passwords.json`, `config.ini`)은 프로그램 폴더에 둔다.

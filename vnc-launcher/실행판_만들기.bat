@@ -13,7 +13,7 @@ py -3 -m pytest -q tests
 if errorlevel 1 goto fail
 
 echo [3/3] exe ºôµå
-py -3 -m PyInstaller --noconfirm --clean --onefile --noconsole --name EquipmentRemote ^
+py -3 -m PyInstaller --noconfirm --clean --onefile --noconsole --name EquipmentRemote --icon assets\app.ico ^
   --exclude-module pytest --exclude-module _pytest --exclude-module pluggy equipment_remote.py
 if errorlevel 1 goto fail
 

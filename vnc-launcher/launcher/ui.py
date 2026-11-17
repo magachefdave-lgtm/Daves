@@ -2208,7 +2208,25 @@ class GroupDialog(_Dialog):
             self.top.destroy()
 
 
+def set_window_icon(root: tk.Tk) -> None:
+    """창 제목 표시줄·작업 표시줄 아이콘. 뒤에 여는 대화상자도 같은 아이콘을 쓴다."""
+    from .icon_data import PNG
+    try:
+        root._icons = [tk.PhotoImage(master=root, data=d) for d in PNG]   # 지우면 아이콘이 사라진다
+        root.iconphoto(True, *root._icons)
+    except tk.TclError:
+        pass   # 아이콘이 없어도 프로그램은 돌아야 한다
+
+
 def main():
+    if sys.platform == "win32":
+        # 작업 표시줄이 이 창을 python 이 아니라 이 프로그램으로 묶고 아이콘을 보이게 한다 (실행.bat 로 켤 때)
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Daves.EquipmentRemote")
+        except (AttributeError, OSError):
+            pass
     root = tk.Tk()
+    set_window_icon(root)
     App(root)
     root.mainloop()
