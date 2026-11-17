@@ -183,13 +183,14 @@ def test_csv_with_password_column(store, tmp_path):
     old = eq("EQ-01", "10.0.0.1")
     store.add(old)
     p = tmp_path / "in.csv"
-    p.write_bytes("설비명,IP,비밀번호\r\nEQ-01,10.0.0.1,aaa\r\nEQ-02,10.0.0.2, b b \r\n"
+    # 비밀번호는 16진수 id 에 우연히 나올 수 없는 글자로 (예전 "aaa" 는 id 와 겹쳐 가끔 실패했다)
+    p.write_bytes("설비명,IP,비밀번호\r\nEQ-01,10.0.0.1,p@ss!\r\nEQ-02,10.0.0.2, b b \r\n"
                   "EQ-03,10.0.0.3,\r\nEQ-04,,zzz\r\n".encode("cp949"))
     added, updated, problems, passwords = store.import_csv(str(p))
     ids = {e.name: e.id for e in store.load()}
     assert (added, updated, len(problems)) == (2, 1, 1)
-    assert passwords == {old.id: "aaa", ids["EQ-02"]: "b b"}   # 빈칸 = 건드리지 않음, 오류 줄 제외
-    assert "aaa" not in open(store.path, encoding="utf-8").read()  # 목록 파일에는 넣지 않는다
+    assert passwords == {old.id: "p@ss!", ids["EQ-02"]: "b b"}   # 빈칸 = 건드리지 않음, 오류 줄 제외
+    assert "p@ss" not in open(store.path, encoding="utf-8").read()  # 목록 파일에는 넣지 않는다
 
 
 def test_csv_password_only_file(store, tmp_path):

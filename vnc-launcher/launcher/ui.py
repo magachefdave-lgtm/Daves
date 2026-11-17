@@ -401,6 +401,7 @@ class App:
         root.bind("<Escape>", lambda _e: self.selecting and self.end_selection())
         root.bind("<Delete>", self._on_delete_key)
         self.search.bind("<Escape>", self._on_search_escape)
+        self.search.bind("<Delete>", self._on_search_delete)
         self.search.bind("<Return>", self._on_enter)
 
         self.menu_opts = dict(tearoff=0, bg=CARD, fg=TEXT, activebackground=ACCENT,
@@ -1080,13 +1081,22 @@ class App:
             return "break"
         return None
 
-    def _on_delete_key(self, _event):
-        # 검색 칸에 늘 커서가 있으므로, 검색어를 고치는 중일 때만 Delete 를 글자 지우기로 본다
-        try:
-            typing = self.root.focus_get() is self.search and bool(self.search_var.get())
-        except (KeyError, tk.TclError):
-            typing = False
-        if self.selecting and self.selected and not typing:
+    def _on_search_delete(self, _event):
+        """검색 칸에는 늘 커서가 있다. 검색 칸이 글자를 지우기 전에 판단한다:
+        지울 글자가 있으면(커서 뒤에 글자가 있거나 글자를 골라 두었으면) 글자를 지우고,
+        없으면 고른 설비를 삭제한다."""
+        if not (self.selecting and self.selected):
+            return None
+        s = self.search
+        if s.selection_present() or s.index("insert") < len(self.search_var.get()):
+            return None
+        self.delete(sorted(self.selected))
+        return "break"
+
+    def _on_delete_key(self, event):
+        if event.widget is self.search:   # 검색 칸에서 누른 것은 _on_search_delete 가 이미 판단했다
+            return
+        if self.selecting and self.selected:
             self.delete(sorted(self.selected))
 
     def toast(self, text: str):
