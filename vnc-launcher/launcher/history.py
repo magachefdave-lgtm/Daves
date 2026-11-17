@@ -56,6 +56,8 @@ class ConnectionLog:
         src = self.path()
         if not os.path.exists(src):
             return None
-        dst = os.path.join(tempfile.gettempdir(), os.path.basename(src)[:-4] + "_보기.csv")
+        # 볼 때마다 다른 이름 - 앞서 연 복사본을 엑셀이 아직 잡고 있어도 막히지 않는다
+        stamp = f"{self.now():%H%M%S}_{os.getpid()}"
+        dst = os.path.join(tempfile.gettempdir(), f"{os.path.basename(src)[:-4]}_보기_{stamp}.csv")
         shutil.copyfile(src, dst)
         return dst

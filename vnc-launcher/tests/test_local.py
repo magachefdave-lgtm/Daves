@@ -88,3 +88,32 @@ def test_connection_log_failure_is_swallowed(tmp_path):
     blocker.write_text("x")
     log = history.ConnectionLog(str(blocker / "sub"))      # 폴더를 만들 수 없는 경로
     assert log.write("VNC 접속", "A", "1.1.1.1") is False
+
+
+def test_two_windows_on_one_pc_do_not_drop_favorites(tmp_path):
+    p = str(tmp_path / "ui_state.json")
+    w1, w2 = local.LocalState(p), local.LocalState(p)   # 같은 PC에 창 두 개
+    w1.set_favorite(["eq3"], True)
+    w1.save()
+    w2.touch("eq9")                                    # 오래된 목록을 들고 있던 창이 저장
+    w2.save()
+    w3 = local.LocalState(p)
+    assert w3.favorites == ["eq3"] and w3.recent == ["eq9"]
+    w4 = local.LocalState(p)
+    w1.set_favorite(["eq5"], True)                     # 두 창이 번갈아 즐겨찾기를 바꿔도
+    w1.save()
+    w4.set_favorite(["eq7"], True)
+    w4.save()
+    assert local.LocalState(p).favorites == ["eq3", "eq5", "eq7"]
+
+
+def test_history_view_copies_do_not_collide(tmp_path):
+    clock = [datetime.datetime(2026, 11, 5, 9, 0, 0)]
+    log = history.ConnectionLog(str(tmp_path), now=lambda: clock[0])
+    log.write("VNC 접속", "A", "1.1.1.1")
+    first = log.view_copy()
+    clock[0] = datetime.datetime(2026, 11, 5, 9, 0, 7)
+    second = log.view_copy()
+    assert first != second and os.path.exists(first) and os.path.exists(second)
+    for f in (first, second):
+        os.remove(f)

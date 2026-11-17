@@ -14,7 +14,7 @@ import shutil
 import socket
 import sys
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 OS_WINDOWS = "Windows"
 OS_CHOICES = (OS_WINDOWS, "Linux", "기타")
@@ -162,6 +162,8 @@ def validate(eq: Equipment) -> list[str]:
         errors.append("IP(또는 호스트명)를 입력하세요.")
     elif not _HOST_RE.match(eq.host):
         errors.append("IP(또는 호스트명)에는 영문, 숫자, 점(.), 하이픈(-)만 쓸 수 있습니다.")
+    elif any(not part or len(part) > 63 for part in eq.host.split(".")):
+        errors.append("IP(또는 호스트명)에 점(.)이 연달아 있거나 너무 긴 부분이 있습니다. 예: 192.168.10.11")
     if not 1 <= eq.port <= 65535:
         errors.append("포트는 1~65535 사이의 숫자여야 합니다. (VNC 기본값 5900)")
     if eq.os not in OS_CHOICES:
@@ -306,15 +308,24 @@ class EquipmentStore:
         items.append(eq)
         self._write(items)
 
-    def update(self, eq: Equipment) -> None:
+    def update(self, eq: Equipment, base: Equipment | None = None) -> None:
+        """설비를 고친다. base(고치기 시작할 때의 내용)를 주면 실제로 바꾼 항목만 반영한다.
+
+        수정 화면을 열어 둔 사이 다른 PC가 붙인 주의 표시나 옮긴 그룹을 덮어쓰지 않으려는 것이다.
+        """
         items = self.load()
-        self._check(eq, items)
-        for i, old in enumerate(items):
-            if old.id == eq.id:
-                items[i] = eq
-                break
-        else:
+        cur = next((e for e in items if e.id == eq.id), None)
+        if cur is None:
             raise StoreError("다른 PC에서 이미 삭제된 설비입니다. 목록을 새로 고쳤습니다.")
+        if base is None:
+            new = eq
+        else:
+            new = Equipment.from_dict(asdict(cur))
+            for f in fields(Equipment):
+                if getattr(eq, f.name) != getattr(base, f.name):
+                    setattr(new, f.name, getattr(eq, f.name))
+        self._check(new, items)
+        items[items.index(cur)] = new
         self._write(items)
 
     def move(self, ids, group: str) -> int:
@@ -384,6 +395,7 @@ class EquipmentStore:
         비밀번호는 목록 파일에 넣지 않고 돌려주기만 한다 - 보관은 PasswordStore 몫.
         IP 열 없이 '설비명,비밀번호'만 있는 파일은 이미 등록된 설비에 비밀번호만 붙인다.
         이미 있는 설비는 CSV에 있는 열만 고치고, CSV에 없는 열은 그대로 둔다.
+        주의 표시 열은 새로 추가하는 설비에만 쓴다 (이미 있는 설비의 표시는 프로그램에서 바꾼다).
         """
         rows, has_host = read_csv(csv_path)
         items = self.load()
@@ -402,8 +414,13 @@ class EquipmentStore:
                     passwords[old.id] = password
                 continue
             old = by_name.get(str(row.get("name", "")).strip().casefold())
-            # 이미 있는 설비: CSV에 없는 열(또는 칸이 모자란 줄)은 기존 값을 지킨다
-            eq = Equipment.from_dict({**asdict(old), **row, "id": old.id} if old else row)
+            if old:
+                # 이미 있는 설비: CSV에 없는 열(또는 칸이 모자란 줄)은 기존 값을 지킨다.
+                # 주의 표시는 현장에서 그때그때 붙이는 것이라, 예전에 내보낸 CSV로 덮지 않는다.
+                row.pop("caution", None)
+                eq = Equipment.from_dict({**asdict(old), **row, "id": old.id})
+            else:
+                eq = Equipment.from_dict(row)
             errors = validate(eq)
             if errors:
                 problems.append(f"{line_no}번째 줄 ({eq.name or '이름 없음'}): {errors[0]}")
@@ -594,7 +611,7 @@ def is_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except OSError:
+    except (OSError, ValueError, OverflowError):   # 잘못 적힌 주소·포트도 "응답 없음"
         return False
 
 

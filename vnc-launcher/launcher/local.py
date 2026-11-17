@@ -22,22 +22,34 @@ class LocalState:
         self.group = ""
         self.load()
 
-    def load(self) -> None:
+    def _read(self) -> dict | None:
         try:
             with open(self.path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            return
-        if not isinstance(data, dict):
-            return
+            return None
+        return data if isinstance(data, dict) else None
 
-        def ids(value) -> list[str]:
-            if not isinstance(value, list):
-                return []
-            return list(dict.fromkeys(v for v in value if isinstance(v, str) and v))
+    @staticmethod
+    def _ids(value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return list(dict.fromkeys(v for v in value if isinstance(v, str) and v))
 
-        self.favorites = ids(data.get("favorites"))
-        self.recent = ids(data.get("recent"))[:RECENT_MAX]
+    def refresh_lists(self) -> None:
+        """즐겨찾기·최근 목록을 파일에서 다시 읽는다. 같은 PC에 창이 두 개 떠 있어도
+        한쪽이 저장할 때 다른 쪽에서 바꾼 것을 지우지 않도록, 바꾸기 직전에 부른다."""
+        data = self._read()
+        if data is not None:
+            self.favorites = self._ids(data.get("favorites"))
+            self.recent = self._ids(data.get("recent"))[:RECENT_MAX]
+
+    def load(self) -> None:
+        data = self._read()
+        if data is None:
+            return
+        self.favorites = self._ids(data.get("favorites"))
+        self.recent = self._ids(data.get("recent"))[:RECENT_MAX]
         self.geometry = data.get("geometry") if isinstance(data.get("geometry"), str) else ""
         self.zoomed = data.get("zoomed") is True
         self.group = data.get("group") if isinstance(data.get("group"), str) else ""
@@ -59,6 +71,7 @@ class LocalState:
 
     def set_favorite(self, ids, on: bool) -> int:
         """즐겨찾기에 넣거나 뺀다. 바뀐 수를 돌려준다."""
+        self.refresh_lists()
         changed = 0
         for eq_id in ids:
             if on and eq_id not in self.favorites:
@@ -71,10 +84,12 @@ class LocalState:
 
     def touch(self, eq_id: str) -> None:
         """방금 접속한 설비를 최근 목록 맨 앞으로."""
+        self.refresh_lists()
         self.recent = ([eq_id] + [r for r in self.recent if r != eq_id])[:RECENT_MAX]
 
     def forget(self, ids) -> None:
         """삭제된 설비를 즐겨찾기·최근 목록에서 뺀다."""
+        self.refresh_lists()
         ids = set(ids)
         self.favorites = [i for i in self.favorites if i not in ids]
         self.recent = [i for i in self.recent if i not in ids]

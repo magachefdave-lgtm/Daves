@@ -91,6 +91,16 @@ TILE_W_WIDE, TILE_W_NARROW, TILE_H, TILE_H_COMPACT, GAP, PAD, GROUP_GAP = 176, 1
 ICON_STEP = 26          # 버튼 안 아이콘(공유폴더·원격 데스크톱) 하나가 차지하는 폭
 
 
+HANGUL_PIN = "PIN에 한글이 들어갔습니다. 한/영 키를 눌러 영문 상태에서 다시 입력하세요."
+
+
+def wrong_pin_text(pin: str) -> str:
+    if not pin.isascii():
+        return HANGUL_PIN
+    return ("PIN이 맞지 않습니다.\n\n"
+            "PIN을 잊었으면 시작하기.txt 의 '편집 잠금' 항목을 보세요. (--reset-pin)")
+
+
 def launch(cmd: list[str]) -> subprocess.Popen:
     # 콘솔 없는 exe에서는 표준 핸들이 유효하지 않아 넘겨주지 않으면 WinError 6이 난다.
     return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -223,6 +233,7 @@ class App:
         self.sunk = None         # 눌려서 내려앉은 설비 버튼
         self.reveal = 0.0        # 처음 나타나는 정도 (1 이상 = 다 나타남)
         self.normal_geometry = ""  # 최대화하기 전의 창 크기·위치
+        self.was_zoomed = False    # 최소화하기 전에 최대화돼 있었는지
         self.th = TILE_H           # 지금 쓰는 버튼 높이
         self._draw_job = self._toast_job = None
         self.store = EquipmentStore("")
@@ -252,6 +263,8 @@ class App:
         self.group = self.local.group or ALL_GROUPS
         self._restore_window()
         root.protocol("WM_DELETE_WINDOW", self.close)
+        # Windows 로그오프·종료·업데이트 재시작 때는 WM_DELETE_WINDOW 없이 이것만 온다
+        root.protocol("WM_SAVE_YOURSELF", self._save_window_state)
         root.bind("<Configure>", self._on_root_configure, add="+")
         self._show_hint()
         self.reload()
@@ -346,11 +359,9 @@ class App:
         self.selbar, selrow = island(root, 52, 5, 45)
         self.sel_label = tk.Label(selrow, font=self.f_group, bg=HEAD, fg=HEAD_TEXT)
         self.sel_label.pack(side="left")
-        tk.Label(selrow, text="클릭 = 고르기·빼기    Shift+클릭 = 범위", font=self.f_small,
-                 bg=HEAD, fg=HEAD_SUB).pack(side="left", padx=(14, 0))
-        PillButton(selrow, "선택 끝내기  Esc", self.end_selection, self.f_body, quiet,
+        PillButton(selrow, "끝내기  Esc", self.end_selection, self.f_body, quiet,
                    HEAD).pack(side="right")
-        PillButton(selrow, "보이는 설비 모두", self.select_all_visible, self.f_body, quiet,
+        PillButton(selrow, "모두 고르기", self.select_all_visible, self.f_body, quiet,
                    HEAD).pack(side="right", padx=6)
         move_btn = PillButton(selrow, "그룹 이동  ▾", None, self.f_body, quiet, HEAD)
         caution_btn = PillButton(selrow, "주의 표시  ▾", None, self.f_body, quiet, HEAD)
@@ -364,6 +375,9 @@ class App:
             caution_btn, move_btn]
         for b in self.sel_buttons:
             b.pack(side="right", padx=(0, 6))
+        # 설명은 맨 나중에 넣어, 창이 좁으면 버튼이 아니라 설명이 줄어들게 한다
+        tk.Label(selrow, text="클릭 = 고르기·빼기    Shift+클릭 = 범위", font=self.f_small, anchor="w",
+                 bg=HEAD, fg=HEAD_SUB).pack(side="left", padx=(14, 0), fill="x", expand=True)
 
         self.body = tk.Frame(root, bg=BG)
         self.body.pack(fill="both", expand=True)
@@ -386,7 +400,7 @@ class App:
         root.bind("<Control-f>", lambda _e: self.search.focus_set())
         root.bind("<Escape>", lambda _e: self.selecting and self.end_selection())
         root.bind("<Delete>", self._on_delete_key)
-        self.search.bind("<Escape>", lambda _e: self.search_var.set(""))
+        self.search.bind("<Escape>", self._on_search_escape)
         self.search.bind("<Return>", self._on_enter)
 
         self.menu_opts = dict(tearoff=0, bg=CARD, fg=TEXT, activebackground=ACCENT,
@@ -472,17 +486,27 @@ class App:
             self.normal_geometry = geometry
         if self.local.zoomed:
             self._set_zoomed()
+        self.was_zoomed = self.local.zoomed
 
     def _on_root_configure(self, event):
         # 최대화하지 않은 때의 크기·위치만 기억한다 - 최대화를 풀었을 때 돌아갈 자리.
-        if event.widget is self.root and self.root.state() == "normal" and not self._is_zoomed():
+        # 최소화된 동안은 아무것도 바꾸지 않는다 (작업 표시줄에서 닫아도 최대화 상태를 지킨다).
+        if event.widget is not self.root or self.root.state() == "iconic":
+            return
+        self.was_zoomed = self._is_zoomed()
+        if self.root.state() == "normal" and not self.was_zoomed:
             self.normal_geometry = self.root.geometry()
 
-    def close(self):
-        self.local.zoomed = self._is_zoomed()
+    def _save_window_state(self):
+        self.local.refresh_lists()   # 같은 PC의 다른 창에서 바꾼 즐겨찾기를 지우지 않게
+        iconic = self.root.state() == "iconic"
+        self.local.zoomed = self.was_zoomed if iconic else self._is_zoomed()
         self.local.geometry = self.normal_geometry or self.root.geometry()
         self.local.group = "" if self.group == ALL_GROUPS else self.group
         self.local.save()
+
+    def close(self):
+        self._save_window_state()
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.log_pool.shutdown(wait=True)   # 남은 접속 이력은 마저 쓴다
         self.root.destroy()
@@ -555,6 +579,7 @@ class App:
                 self.open_groups()
             elif tag.startswith("chip:"):
                 self.group = tag[5:]
+                self._save_window_state()
                 self._draw_chips()
                 self.canvas.yview_moveto(0)
                 self.draw()
@@ -656,8 +681,10 @@ class App:
         # 그룹 이름은 받침판 왼쪽 칸에 둔다 - 제목 줄을 따로 쓰지 않아 세로 공간을 아낀다.
         label_w = 0
         if labels:
-            texts = [g or NO_GROUP for g in names] + (["★ 즐겨찾기", "최근 접속 포함"] if has_quick else [])
-            label_w = min(140, max(self.f_group.measure(t) for t in texts) + 26)
+            titles = [g or NO_GROUP for g in names] + (["★ 즐겨찾기"] if has_quick else [])
+            subs = [f"{len(by_group[g])}대" for g in names] + (["최근 접속 포함"] if has_quick else [])
+            label_w = min(140, max(max(self.f_group.measure(t) for t in titles),
+                                   max(self.f_small.measure(t) for t in subs)) + 26)
         avail = width - 2 * PAD - 2 * TRAY_PAD - label_w
         cols_for = lambda tile_w: max(1, int((avail + GAP) // (tile_w + GAP)))
         top = 2
@@ -881,8 +908,9 @@ class App:
         self.hover = new
         self._foot()
 
-    def _on_press(self, _event):
+    def _on_press(self, event):
         """누르면 버튼이 그림자 위로 내려앉는다."""
+        self._on_motion(event)   # 화면을 다시 그린 뒤 마우스를 움직이지 않고 눌러도 알아듣게
         self.pressed = self.hover
         if self.hover[0] and not self.sunk:
             self.canvas.move(f"inst:{self.hover[0]}", 0, 2)
@@ -1045,9 +1073,17 @@ class App:
         elif shown:
             self.toast(f"설비 {len(shown)}대가 보입니다. 한 대만 남도록 검색하면 Enter로 바로 접속합니다.")
 
+    def _on_search_escape(self, _event):
+        """Esc 는 한 겹씩: 검색어가 있으면 검색어만 지우고, 없으면 여러 대 선택을 끝낸다."""
+        if self.search_var.get():
+            self.search_var.set("")
+            return "break"
+        return None
+
     def _on_delete_key(self, _event):
+        # 검색 칸에 늘 커서가 있으므로, 검색어를 고치는 중일 때만 Delete 를 글자 지우기로 본다
         try:
-            typing = isinstance(self.root.focus_get(), (tk.Entry, ttk.Entry))
+            typing = self.root.focus_get() is self.search and bool(self.search_var.get())
         except (KeyError, tk.TclError):
             typing = False
         if self.selecting and self.selected and not typing:
@@ -1163,7 +1199,7 @@ class App:
         if pin is None:
             return False
         if not check_pin(self.store.lock, pin):
-            messagebox.showwarning(APP_NAME, "PIN이 맞지 않습니다.")
+            messagebox.showwarning(APP_NAME, wrong_pin_text(pin))
             return False
         self.unlocked_at = time.monotonic()
         self._summary()
@@ -1181,7 +1217,7 @@ class App:
 
         def save(current: str, new: str | None) -> bool:
             if has_lock and not check_pin(self.store.lock, current):
-                messagebox.showwarning(APP_NAME, "지금 PIN이 맞지 않습니다.", parent=dlg.top)
+                messagebox.showwarning(APP_NAME, wrong_pin_text(current), parent=dlg.top)
                 return False
             try:
                 self.store.set_lock(new)
@@ -1477,7 +1513,10 @@ class App:
 
         def save(new: Equipment, password):
             try:
-                (self.store.add if is_new else self.store.update)(new)
+                if is_new:
+                    self.store.add(new)
+                else:   # 창을 연 뒤 다른 PC가 바꾼 항목(주의 표시 등)은 지킨다
+                    self.store.update(new, base=eq)
             except StoreError as e:
                 messagebox.showwarning(APP_NAME, str(e), parent=dlg.top)
                 self.reload()
@@ -1590,7 +1629,8 @@ class App:
         try:
             copy = self.log.view_copy()
         except OSError as e:
-            messagebox.showerror(APP_NAME, f"접속 이력을 읽을 수 없습니다.\n{self.log.path()}\n({e})")
+            messagebox.showerror(APP_NAME, f"접속 이력을 임시 폴더로 복사하지 못했습니다.\n"
+                                           f"{self.log.path()}\n({e})")
             return
         if copy:
             self._open_path(copy)
@@ -1639,11 +1679,18 @@ class App:
             if not quiet and self.status.get(e.id) is None:
                 self.status[e.id] = "busy"
             self.pending += 1
-            self.pool.submit(lambda e=e: self.results.put(
-                (e.id, e.host, e.port, is_reachable(e.host, e.port, timeout))))
+            self.pool.submit(self._probe, e.id, e.host, e.port, timeout)
         if not quiet:
             self.check_btn.set_enabled(False, "확인 중…")
             self.draw()
+
+    def _probe(self, eq_id: str, host: str, port: int, timeout: float):
+        """일꾼 스레드에서 돈다. 무슨 일이 있어도 결과를 하나 남겨야 확인이 끝난다."""
+        try:
+            ok = is_reachable(host, port, timeout)
+        except Exception:
+            ok = False
+        self.results.put((eq_id, host, port, ok))
 
     def _poll_results(self):
         changed = got = False
@@ -1712,7 +1759,12 @@ class _Dialog:
         p = self.top.master
         x = p.winfo_rootx() + (p.winfo_width() - self.top.winfo_width()) // 2
         y = p.winfo_rooty() + (p.winfo_height() - self.top.winfo_height()) // 3
-        self.top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        # 모든 모니터를 합친 영역 안으로 (왼쪽·위쪽 모니터는 좌표가 음수다)
+        t = self.top
+        vx, vy, vw, vh = t.winfo_vrootx(), t.winfo_vrooty(), t.winfo_vrootwidth(), t.winfo_vrootheight()
+        x = max(vx, min(x, vx + vw - t.winfo_width()))
+        y = max(vy, min(y, vy + vh - t.winfo_height()))
+        self.top.geometry(f"+{x}+{y}")
         try:
             self.top.grab_set()
         except tk.TclError:
@@ -1945,7 +1997,8 @@ class LockDialog(_Dialog):
         ttk.Label(b, foreground=SUB, justify="left", text=(
             "잠그면 설비 추가·수정·삭제, 그룹 변경, 버튼 표시 변경 때 PIN을 묻습니다.\n"
             "접속, 주의 표시, 즐겨찾기, 비밀번호 저장은 PIN 없이 쓸 수 있습니다.\n"
-            "PIN은 설비 목록 파일에 저장되어, 목록을 함께 쓰는 모든 PC에 적용됩니다.")).grid(
+            "PIN은 설비 목록 파일에 저장되어, 목록을 함께 쓰는 모든 PC에 적용됩니다.\n"
+            "PIN을 잊으면  EquipmentRemote.exe --reset-pin  으로 잠금을 끌 수 있습니다.")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         self._row = 1
         first = None
@@ -1953,7 +2006,7 @@ class LockDialog(_Dialog):
             first = ttk.Entry(b, textvariable=self.current, show="*", width=24)
             self.field("지금 PIN", first)
         self.new_entry = ttk.Entry(b, textvariable=self.new, show="*", width=24)
-        self.field("새 PIN", self.new_entry, f"{PIN_MIN}자 이상")
+        self.field("새 PIN", self.new_entry, f"영문·숫자 {PIN_MIN}자 이상")
         self.again_entry = ttk.Entry(b, textvariable=self.again, show="*", width=24)
         self.field("새 PIN 확인", self.again_entry)
         if has_lock:
@@ -1970,6 +2023,9 @@ class LockDialog(_Dialog):
         off = self.off.get()
         new = self.new.get()
         if not off:
+            if not new.isascii():   # Tk 의 * 칸은 한글 입력기를 끄지 않는다
+                messagebox.showwarning(APP_NAME, HANGUL_PIN, parent=self.top)
+                return
             if len(new) < PIN_MIN:
                 messagebox.showwarning(APP_NAME, f"PIN은 {PIN_MIN}자 이상이어야 합니다.", parent=self.top)
                 return

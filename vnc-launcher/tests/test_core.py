@@ -73,7 +73,7 @@ def test_duplicate_name_rejected(store):
         store.add(eq("eq-01", "10.0.0.9"))
 
 
-@pytest.mark.parametrize("host", ["", "-evil", "10.0.0.1 -x", "a/b", "한글"])
+@pytest.mark.parametrize("host", ["", "-evil", "10.0.0.1 -x", "a/b", "한글", "10.0.0..1", "a" * 64 + ".lan"])
 def test_bad_host_rejected(store, host):
     with pytest.raises(StoreError):
         store.add(eq(host=host))
@@ -351,12 +351,12 @@ def test_backup_failure_does_not_block_save(store, monkeypatch):
     with pytest.raises(StoreError):                    # .bak 복사도 같은 함수를 쓰므로 막히면 오류
         store.add(eq("B", "10.0.0.2"))
     monkeypatch.undo()
-    real = core.shutil.copy2
-    monkeypatch.setattr(store, "backup_dir", lambda: "/proc/no-such-dir/backup")
+    blocker = os.path.join(os.path.dirname(store.path), "not-a-folder")
+    open(blocker, "w").close()                         # 파일 아래에는 폴더를 만들 수 없다 (어느 OS든)
+    monkeypatch.setattr(store, "backup_dir", lambda: os.path.join(blocker, "backup"))
     store.today = lambda: "2026-12-01"
     store.add(eq("B", "10.0.0.2"))                     # 백업 폴더를 못 만들어도 저장은 된다
     assert [e.name for e in store.load()] == ["A", "B"]
-    assert real is core.shutil.copy2
 
 
 def test_config_new_options_roundtrip(tmp_path):
@@ -369,3 +369,34 @@ def test_config_new_options_roundtrip(tmp_path):
     assert core.load_config(p).auto_check_minutes == 60
     assert core.load_config(str(tmp_path / "none.ini")) == Config()     # 기본: RDP 끔, 1분, 이력 켬
     assert (Config().show_rdp, Config().auto_check_minutes, Config().connection_log) == (False, 1, True)
+
+
+def test_is_reachable_never_raises_on_bad_input():
+    assert core.is_reachable("10.0.0..1", 5900, 0.2) is False     # idna 가 UnicodeError 를 낸다
+    assert core.is_reachable("127.0.0.1", 70000, 0.2) is False    # 범위 밖 포트는 OverflowError
+
+
+def test_update_with_base_keeps_changes_made_elsewhere(store):
+    a = eq("EQ-07", memo="old")
+    store.add(a)
+    opened = store.load()[0]                       # PC A 가 수정 화면을 연 때의 내용
+    EquipmentStore(store.path).set_fields([a.id], caution="접속 금지")   # 그 사이 PC B
+    EquipmentStore(store.path).move([a.id], "식각")
+    edited = Equipment.from_dict({**core.asdict(opened), "memo": "새 메모"})
+    store.update(edited, base=opened)
+    got = store.load()[0]
+    assert (got.memo, got.caution, got.group) == ("새 메모", "접속 금지", "식각")
+    cleared = Equipment.from_dict({**core.asdict(opened), "caution": "PM 중"})
+    store.update(cleared, base=opened)             # 직접 바꾼 항목은 반영된다
+    assert store.load()[0].caution == "PM 중"
+    store.update(Equipment.from_dict({**core.asdict(opened), "caution": ""}))   # base 없이 = 통째로
+    assert store.load()[0].caution == ""
+
+
+def test_csv_caution_only_for_new_equipment(store, tmp_path):
+    store.add(eq("EQ-01", caution="PM 중"))
+    p = tmp_path / "in.csv"
+    p.write_text("설비명,IP,주의\nEQ-01,10.0.0.1,\nEQ-02,10.0.0.2,점검 중\n", encoding="utf-8")
+    store.import_csv(str(p))
+    got = {e.name: e.caution for e in store.load()}
+    assert got == {"EQ-01": "PM 중", "EQ-02": "점검 중"}    # 예전 CSV 로 현장 표시를 지우지 않는다
