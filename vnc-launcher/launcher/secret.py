@@ -1,6 +1,6 @@
 """VNC 비밀번호 보관 - Windows DPAPI로 암호화해 이 PC, 이 사용자 계정에서만 풀린다.
 
-설비 목록 파일(공유될 수 있음)에는 비밀번호를 넣지 않고, 프로그램 폴더의
+설비 목록 파일(공유될 수 있음)에는 비밀번호를 넣지 않고, 설정 폴더(core.app_dir)의
 passwords.json 에 따로 둔다.
 """
 from __future__ import annotations

@@ -617,11 +617,38 @@ def is_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
 
 # --------------------------------------------------------------- 설정 ---
 
-def app_dir() -> str:
+DATA_FOLDER = "설비원격접속"
+
+
+def exe_dir() -> str:
     """exe(또는 실행 스크립트)가 놓인 폴더."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def app_dir() -> str:
+    """설정·비밀번호·즐겨찾기를 두는 폴더.
+
+    exe 옆에 config.ini 가 이미 있으면(예전부터 그 폴더에서 쓰던 경우) 그 폴더를 그대로 쓰고,
+    없으면 사람마다 따로인 %LOCALAPPDATA%\설비원격접속 을 쓴다. 그래서 exe 하나를 공유 폴더에
+    두고 여러 사람이 실행해도 설정이 섞이지 않고, 쓰기 권한이 없는 폴더에서도 돈다.
+    """
+    here = exe_dir()
+    if os.path.exists(os.path.join(here, "config.ini")):
+        return here
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    path = os.path.join(base, DATA_FOLDER)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return here
+    return path
+
+
+def resource_path(name: str) -> str:
+    """exe 안에 넣어 둔 파일(사용법, CSV 양식)의 경로."""
+    return os.path.join(getattr(sys, "_MEIPASS", exe_dir()), name)
 
 
 def _read_text(path: str) -> str:
@@ -690,7 +717,7 @@ title_with_name = {"yes" if cfg.title_with_name else "no"}
 quiet_connect = {"yes" if cfg.quiet_connect else "no"}
 
 [data]
-; 설비 목록 파일 위치. 비워 두면 프로그램 폴더의 equipment.json 을 씁니다.
+; 설비 목록 파일 위치. 비워 두면 이 설정 파일과 같은 폴더의 equipment.json 을 씁니다.
 ; 여러 PC가 같은 목록을 쓰려면 공유 폴더 경로를 적습니다. 예: \\\\서버\\공유\\equipment.json
 equipment_file = {cfg.equipment_file}
 ; 접속 이력을 설비 목록 파일과 같은 폴더에 달마다 CSV로 남길지 (yes / no)

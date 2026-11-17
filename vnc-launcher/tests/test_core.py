@@ -401,3 +401,21 @@ def test_csv_caution_only_for_new_equipment(store, tmp_path):
     store.import_csv(str(p))
     got = {e.name: e.caution for e in store.load()}
     assert got == {"EQ-01": "PM 중", "EQ-02": "점검 중"}    # 예전 CSV 로 현장 표시를 지우지 않는다
+
+
+# ---------------------------------------------------------------- 설정 폴더 ---
+
+def test_app_dir_is_per_user_unless_old_folder(tmp_path, monkeypatch):
+    exe = tmp_path / "share"           # exe 를 둔 공유 폴더
+    exe.mkdir()
+    monkeypatch.setattr(core, "exe_dir", lambda: str(exe))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "user"))
+    assert core.app_dir() == str(tmp_path / "user" / core.DATA_FOLDER)   # 사람마다 따로
+    assert os.path.isdir(core.app_dir())
+    (exe / "config.ini").write_text("[viewer]\n", encoding="utf-8")       # 예전부터 exe 옆에서 쓰던 경우
+    assert core.app_dir() == str(exe)
+
+
+def test_embedded_files_exist():
+    for name in ("시작하기.txt", "설비목록_예시.csv", "비밀번호_예시.csv"):
+        assert os.path.isfile(core.resource_path(name)), name

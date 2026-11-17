@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -14,11 +16,16 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from . import APP_NAME, APP_VERSION, secret, wintitle
 from .core import (BACKUP_KEEP, CAUTION_MAX, CAUTION_PRESETS, OS_CHOICES, OS_WINDOWS, PIN_MIN,
                    VIEWERS, Config, Equipment, EquipmentStore, StoreError, app_dir, build_command,
+                   resource_path,
                    check_pin, detect_viewer, equipment_file, export_csv, has_rdp, has_share,
                    is_reachable, load_config, natural_key, rdp_command, read_csv, save_config,
                    share_path)
 from .history import ConnectionLog
 from .local import LocalState, fit_geometry, quick_ids
+from .site_defaults import SHARED_EQUIPMENT_FILE
+
+GUIDE = "시작하기.txt"                                   # exe 안에 넣어 두는 사용법
+TEMPLATES = ("설비목록_예시.csv", "비밀번호_예시.csv")    # exe 안에 넣어 두는 CSV 양식
 
 ALL_GROUPS = "전체"
 NO_GROUP = "그룹 없음"
@@ -98,7 +105,7 @@ def wrong_pin_text(pin: str) -> str:
     if not pin.isascii():
         return HANGUL_PIN
     return ("PIN이 맞지 않습니다.\n\n"
-            "PIN을 잊었으면 시작하기.txt 의 '편집 잠금' 항목을 보세요. (--reset-pin)")
+            "PIN을 잊었으면 [더보기 > 사용법 보기]의 '11. 편집 잠금'을 보세요. (--reset-pin)")
 
 
 def launch(cmd: list[str]) -> subprocess.Popen:
@@ -257,6 +264,7 @@ class App:
             found = detect_viewer()
             if found:
                 self.cfg.viewer_type, self.cfg.viewer_path = found
+            self.cfg.equipment_file = SHARED_EQUIPMENT_FILE
             self._save_config()
         self.passwords = secret.PasswordStore(os.path.join(app_dir(), "passwords.json"))
         self._open_store()
@@ -275,6 +283,8 @@ class App:
         self.root.after(5000, self._watch_file)
         self.root.after(1000, self._tick_sessions)
         self.root.after(15000, self._tick_clock)
+        if first_run:   # 처음 켠 사람: 뷰어와 설비 목록 위치를 확인하게 한다
+            self.root.after(900, lambda: self.open_settings(first=True))
 
     # ------------------------------------------------------------ 화면 ---
 
@@ -431,6 +441,10 @@ class App:
                 m.add_command(label="편집 잠금 풀기", command=self._can_edit)
         m.add_command(label="편집 잠금 설정…", command=self.open_lock)
         m.add_command(label="설정", command=self.open_settings)
+        m.add_separator()
+        m.add_command(label="사용법 보기", command=self.open_guide)
+        m.add_command(label="CSV 양식 저장…", command=self.save_templates)
+        m.add_command(label="설정 폴더 열기", command=lambda: self._open_path(app_dir()))
         b = self.more_btn
         m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 2)
 
@@ -1605,7 +1619,7 @@ class App:
         try:
             self.passwords.set_many(passwords)
         except OSError as e:
-            return f"비밀번호를 저장하지 못했습니다. 프로그램 폴더의 쓰기 권한을 확인하세요.\n({e})"
+            return f"비밀번호를 저장하지 못했습니다. 설정 폴더(더보기 > 설정 폴더 열기)의 쓰기 권한을 확인하세요.\n({e})"
         text = (f"비밀번호 저장 {len(passwords)}대 - 이 PC에 암호화해 기억했으므로 "
                 "다시 가져올 필요가 없습니다.\n\n"
                 "가져온 파일에는 비밀번호가 그대로 적혀 있으니 안전한 곳에 두거나 지우세요.")
@@ -1649,6 +1663,37 @@ class App:
         else:
             messagebox.showinfo(APP_NAME, f"이번 달 접속 이력이 아직 없습니다.\n{self.log.path()}")
 
+    def open_guide(self):
+        """exe 안에 넣어 둔 사용법을 임시 폴더에 꺼내 메모장으로 연다."""
+        try:
+            dst = os.path.join(tempfile.gettempdir(), f"설비원격접속_사용법_v{APP_VERSION}.txt")
+            shutil.copyfile(resource_path(GUIDE), dst)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"사용법 파일을 꺼내지 못했습니다.\n({e})")
+            return
+        self._open_path(dst)
+
+    def save_templates(self):
+        """CSV 양식(설비 목록, 비밀번호)을 고른 폴더에 저장한다."""
+        folder = filedialog.askdirectory(title="CSV 양식을 저장할 폴더")
+        if not folder:
+            return
+        saved = []
+        try:
+            for name in TEMPLATES:
+                dst = os.path.join(folder, name)
+                if os.path.exists(dst) and not messagebox.askyesno(
+                        APP_NAME, f"이미 있는 파일입니다. 덮어쓸까요?\n{dst}", default="no"):
+                    continue
+                shutil.copyfile(resource_path(name), dst)
+                saved.append(name)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"양식을 저장하지 못했습니다.\n({e})")
+            return
+        if saved:
+            messagebox.showinfo(APP_NAME, "저장했습니다. 엑셀로 열어 고친 뒤 [더보기 > CSV 가져오기]로 가져오세요.\n\n"
+                                + "\n".join(os.path.join(folder, n) for n in saved))
+
     def open_backups(self):
         folder = self.store.backup_dir()
         if os.path.isdir(folder):
@@ -1658,8 +1703,10 @@ class App:
                 "아직 백업이 없습니다.\n"
                 f"설비 목록을 바꾸는 날마다 처음 바꾸기 직전 상태를 {BACKUP_KEEP}일치 남깁니다.\n{folder}"))
 
-    def open_settings(self):
-        dlg = SettingsDialog(self.root, self.cfg)
+    def open_settings(self, first: bool = False):
+        intro = ("처음 실행하셨습니다. VNC 뷰어와 설비 목록 위치를 확인하고 [저장]을 누르세요.\n"
+                 "부서가 함께 쓰는 목록이 있으면 '설비 목록 파일'에 그 경로를 넣습니다.") if first else ""
+        dlg = SettingsDialog(self.root, self.cfg, intro)
 
         def save(cfg: Config):
             old = self.cfg
@@ -1867,10 +1914,14 @@ AUTO_CHECK_CHOICES = {"끔": 0, "1분마다": 1, "3분마다": 3, "5분마다": 
 
 
 class SettingsDialog(_Dialog):
-    def __init__(self, parent, cfg: Config):
-        super().__init__(parent, "설정")
+    def __init__(self, parent, cfg: Config, intro: str = ""):
+        super().__init__(parent, "처음 설정" if intro else "설정")
         self.cfg = cfg
         b = self.body
+        if intro:
+            ttk.Label(b, text=intro, foreground=ACCENT_DARK, justify="left").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+            self._row = 1
         self.keys = list(VIEWERS)
         self.vtype = tk.StringVar(value=VIEWERS[cfg.viewer_type]["label"])
         self.vpath = tk.StringVar(value=cfg.viewer_path)
@@ -1907,7 +1958,7 @@ class SettingsDialog(_Dialog):
         ttk.Entry(row2, textvariable=self.efile).pack(side="left", fill="x", expand=True)
         ttk.Button(row2, text="찾기", width=6, command=self._browse_file).pack(side="left", padx=(4, 0))
         self.field("설비 목록 파일", row2,
-                   "비우면 프로그램 폴더의 equipment.json. 공유 폴더 경로를 넣으면 여러 PC가 같이 씁니다")
+                   "비우면 이 PC에만 둡니다. 공유 폴더 경로를 넣으면 부서가 같은 목록을 같이 씁니다")
 
         opts = ttk.Frame(b)
 

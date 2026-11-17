@@ -29,26 +29,27 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --noconsole
           --name EquipmentRemote --icon assets/app.ico
+          --add-data "시작하기.txt;." --add-data "설비목록_예시.csv;." --add-data "비밀번호_예시.csv;."
           --exclude-module pytest --exclude-module _pytest --exclude-module pluggy
           equipment_remote.py
-      - name: Add user documents
-        run: Copy-Item *.txt, *.csv dist/
       - uses: actions/upload-artifact@v4
         with:
           name: EquipmentRemote
           path: vnc-launcher/dist/
           if-no-files-found: error
       # Commit message containing [publish-zip] also stores the build in the branch,
-      # for places that cannot reach the Actions artifact storage.
-      - name: Publish zip to branch
+      # for places that cannot reach the Actions artifact storage. It is a single exe:
+      # the user guide and CSV templates are inside it.
+      - name: Publish exe to branch
         if: contains(github.event.head_commit.message, '[publish-zip]')
         shell: bash
         working-directory: .
         run: |
           mkdir -p release
-          python -c "import zipfile,os; d='vnc-launcher/dist'; z=zipfile.ZipFile('release/EquipmentRemote.zip','w',zipfile.ZIP_DEFLATED); [z.write(os.path.join(d,f),'EquipmentRemote/'+f) for f in sorted(os.listdir(d))]; z.close()"
+          git rm -q --ignore-unmatch release/EquipmentRemote.zip
+          cp vnc-launcher/dist/EquipmentRemote.exe release/EquipmentRemote.exe
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f release/EquipmentRemote.zip
-          git commit -m "Add built EquipmentRemote.zip"
+          git add -f release/EquipmentRemote.exe
+          git commit -m "Add built EquipmentRemote.exe"
           git push

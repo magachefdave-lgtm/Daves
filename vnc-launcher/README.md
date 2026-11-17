@@ -7,7 +7,7 @@
 
 - 사용법: [시작하기.txt](시작하기.txt)
 - 바로 실행: `실행.bat` (Python 3.10+ 필요) 또는 `python equipment_remote.py`
-- exe 만들기: Windows PC에서 `실행판_만들기.bat` → `dist/EquipmentRemote.exe`
+- exe 만들기: Windows PC에서 `실행판_만들기.bat` → `dist/EquipmentRemote.exe` (이 파일 하나만 배포)
 - 테스트: `python -m pytest -q tests`
 
 | 파일 | 내용 |
@@ -21,7 +21,11 @@
 | `assets/app.ico`, `launcher/icon_data.py` | 프로그램 아이콘 (`python tools/make_icon.py` 로 다시 만든다, Pillow 필요) |
 
 공유 목록(`equipment.json`)에는 설비, 그룹 순서, 주의 표시, 편집 잠금(PIN 해시)이 들어가고,
-PC마다 다른 것(`ui_state.json`, `passwords.json`, `config.ini`)은 프로그램 폴더에 둔다.
+사람마다 다른 것(`ui_state.json`, `passwords.json`, `config.ini`)은 `%LOCALAPPDATA%\설비원격접속`에 둔다
+(exe 옆에 `config.ini`가 이미 있으면 그 폴더). 그래서 exe 하나를 공유 폴더에 두고 여러 사람이 실행해도 된다.
+
+배포는 `EquipmentRemote.exe` 하나다. 사용법과 CSV 양식은 exe 안에 들어 있다(`--add-data`).
+부서 공유 목록 경로를 `launcher/site_defaults.py`에 적고 빌드하면 처음 실행할 때 그 경로가 미리 채워진다.
 PIN 을 잊으면 `EquipmentRemote.exe --reset-pin`.
 
 `.bat` 파일은 CP949 + CRLF 로 저장해야 한다 (UTF-8 로 저장하면 한글 cmd 에서 깨진다).

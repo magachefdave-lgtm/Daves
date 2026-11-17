@@ -13,17 +13,15 @@ py -3 -m pytest -q tests
 if errorlevel 1 goto fail
 
 echo [3/3] exe 빌드
+rem 사용법과 CSV 양식은 exe 안에 넣는다 - 배포는 exe 파일 하나로 끝난다
 py -3 -m PyInstaller --noconfirm --clean --onefile --noconsole --name EquipmentRemote --icon assets\app.ico ^
+  --add-data "시작하기.txt;." --add-data "설비목록_예시.csv;." --add-data "비밀번호_예시.csv;." ^
   --exclude-module pytest --exclude-module _pytest --exclude-module pluggy equipment_remote.py
 if errorlevel 1 goto fail
-
-copy /y "시작하기.txt" dist\ >nul
-copy /y "설비목록_예시.csv" dist\ >nul
-copy /y "비밀번호_예시.csv" dist\ >nul
-if not exist "dist\시작하기.txt" goto fail
+if not exist "dist\EquipmentRemote.exe" goto fail
 
 echo.
-echo 완료: dist 폴더의 내용을 통째로 사용할 PC에 복사하세요.
+echo 완료: dist\EquipmentRemote.exe 파일 하나만 나눠 주면 됩니다.
 pause
 exit /b 0
 
