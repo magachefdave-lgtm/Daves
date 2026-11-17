@@ -45,8 +45,8 @@ jobs:
         shell: bash
         working-directory: .
         run: |
-          mkdir -p release
           git rm -q --ignore-unmatch release/EquipmentRemote.zip
+          mkdir -p release   # 위에서 zip 을 지우면 빈 release 폴더도 사라지므로 그 뒤에 만든다
           cp vnc-launcher/dist/EquipmentRemote.exe release/EquipmentRemote.exe
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
