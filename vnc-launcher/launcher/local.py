@@ -20,6 +20,7 @@ class LocalState:
         self.geometry = ""               # "폭x높이+x+y" (최대화하기 전의 크기)
         self.zoomed = False
         self.group = ""
+        self.applied_pack = ""           # 이미 가져온 배포본 id (같은 배포본을 다시 묻지 않게)
         self.load()
 
     def _read(self) -> dict | None:
@@ -53,11 +54,12 @@ class LocalState:
         self.geometry = data.get("geometry") if isinstance(data.get("geometry"), str) else ""
         self.zoomed = data.get("zoomed") is True
         self.group = data.get("group") if isinstance(data.get("group"), str) else ""
+        self.applied_pack = data.get("applied_pack") if isinstance(data.get("applied_pack"), str) else ""
 
     def save(self) -> bool:
         tmp = self.path + ".tmp"
         data = {"favorites": self.favorites, "recent": self.recent, "geometry": self.geometry,
-                "zoomed": self.zoomed, "group": self.group}
+                "zoomed": self.zoomed, "group": self.group, "applied_pack": self.applied_pack}
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)

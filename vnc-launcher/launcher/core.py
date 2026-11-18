@@ -375,6 +375,30 @@ class EquipmentStore:
             self._write(items)
         return changed
 
+    def merge(self, items: list[dict], groups: list[str]) -> tuple[int, int]:
+        """배포본의 설비 목록을 합친다: 같은 id 는 배포본 내용으로, 없는 것은 추가. (추가 수, 수정 수)
+
+        같은 이름이 다른 id 로 이미 있으면(각자 따로 등록한 경우) 그 설비를 배포본 것으로 바꾼다.
+        """
+        mine = self.load()
+        by_id = {e.id: i for i, e in enumerate(mine)}
+        by_name = {e.name.casefold(): i for i, e in enumerate(mine)}
+        added = updated = 0
+        for d in items:
+            eq = Equipment.from_dict(d)
+            if validate(eq):
+                continue
+            i = by_id.get(eq.id, by_name.get(eq.name.casefold()))
+            if i is None:
+                mine.append(eq)
+                added += 1
+            elif mine[i] != eq:
+                mine[i] = eq
+                updated += 1
+        if added or updated or [g for g in groups if g not in self.groups]:
+            self._write(mine, self.groups + [g for g in groups if g not in self.groups])
+        return added, updated
+
     def set_lock(self, pin: str | None) -> None:
         """편집 잠금 PIN 을 정한다. None 이면 잠금을 없앤다."""
         items = self.load()

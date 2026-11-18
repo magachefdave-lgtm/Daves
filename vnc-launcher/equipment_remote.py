@@ -56,6 +56,17 @@ def reset_pin() -> None:
 
 if __name__ == "__main__":
     try:
+        if "--pack-info" in sys.argv[1:]:   # 빌드 검사용: 배포본 내용(비밀번호 제외)을 파일로 남긴다
+            import json
+            from launcher.pack import own_exe, read_pack
+            out = sys.argv[sys.argv.index("--pack-info") + 1]
+            pack = read_pack(own_exe())
+            info = None if pack is None else {k: pack.get(k) for k in ("id", "made", "password_count")}
+            if pack and pack.get("equipment"):
+                info["items"] = len(pack["equipment"].get("items", []))
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump({"pack": info}, f, ensure_ascii=False)
+            sys.exit(0)
         if "--reset-pin" in sys.argv[1:]:
             reset_pin()
             sys.exit(0)

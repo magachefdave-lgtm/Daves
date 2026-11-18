@@ -32,6 +32,15 @@ jobs:
           --add-data "시작하기.txt;." --add-data "설비목록_예시.csv;." --add-data "비밀번호_예시.csv;."
           --exclude-module pytest --exclude-module _pytest --exclude-module pluggy
           equipment_remote.py
+      # 배포본(exe 끝에 설정을 붙인 것)이 Windows 에서도 그대로 실행되는지 실제로 돌려 본다
+      - name: Check a deploy package runs on Windows
+        timeout-minutes: 5
+        run: |
+          python -c "from launcher.pack import make_payload, write_pack; write_pack('dist/EquipmentRemote.exe', 'packcheck.exe', make_payload({'viewer_type': 'ultravnc'}, {'groups': [], 'items': [{'name': 'A', 'host': '10.0.0.1'}]}, {'x': 'pw'}, 'abc'))"
+          Start-Process -Wait -FilePath .\packcheck.exe -ArgumentList '--pack-info','packinfo.json'
+          Start-Process -Wait -FilePath .\dist\EquipmentRemote.exe -ArgumentList '--pack-info','plaininfo.json'
+          python -c "import json; p=json.load(open('packinfo.json',encoding='utf-8'))['pack']; n=json.load(open('plaininfo.json',encoding='utf-8'))['pack']; assert p and p['items']==1 and p['password_count']==1, p; assert n is None, n; print('deploy package ok', p)"
+          Remove-Item packcheck.exe, packinfo.json, plaininfo.json
       - uses: actions/upload-artifact@v4
         with:
           name: EquipmentRemote

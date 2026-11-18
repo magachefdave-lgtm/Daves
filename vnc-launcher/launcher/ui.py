@@ -1,6 +1,8 @@
 """tkinter 화면 - 설비를 카드형 버튼으로 보여 준다."""
 from __future__ import annotations
 
+import dataclasses
+import datetime
 import os
 import queue
 import shutil
@@ -22,6 +24,7 @@ from .core import (BACKUP_KEEP, CAUTION_MAX, CAUTION_PRESETS, OS_CHOICES, OS_WIN
                    share_path)
 from .history import ConnectionLog
 from .local import LocalState, fit_geometry, quick_ids
+from .pack import PackError, make_payload, own_exe, read_pack, unseal, write_pack
 from .site_defaults import SHARED_EQUIPMENT_FILE
 
 GUIDE = "시작하기.txt"                                   # exe 안에 넣어 두는 사용법
@@ -99,6 +102,7 @@ ICON_STEP = 26          # 버튼 안 아이콘(공유폴더·원격 데스크톱
 
 
 HANGUL_PIN = "PIN에 한글이 들어갔습니다. 한/영 키를 눌러 영문 상태에서 다시 입력하세요."
+HANGUL_PHRASE = "배포 암호에 한글이 들어갔습니다. 한/영 키를 눌러 영문 상태에서 다시 입력하세요."
 
 
 def wrong_pin_text(pin: str) -> str:
@@ -268,6 +272,7 @@ class App:
             self._save_config()
         self.passwords = secret.PasswordStore(os.path.join(app_dir(), "passwords.json"))
         self._open_store()
+        pack_ok = self._maybe_apply_pack(first_run)   # 배포본이면 넣어 둔 설정을 가져온다
         self.group = self.local.group or ALL_GROUPS
         self._restore_window()
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -283,7 +288,7 @@ class App:
         self.root.after(5000, self._watch_file)
         self.root.after(1000, self._tick_sessions)
         self.root.after(15000, self._tick_clock)
-        if first_run:   # 처음 켠 사람: 뷰어와 설비 목록 위치를 확인하게 한다
+        if first_run and not pack_ok:   # 처음 켠 사람: 뷰어와 설비 목록 위치를 확인하게 한다
             self.root.after(900, lambda: self.open_settings(first=True))
 
     # ------------------------------------------------------------ 화면 ---
@@ -442,6 +447,7 @@ class App:
         m.add_command(label="편집 잠금 설정…", command=self.open_lock)
         m.add_command(label="설정", command=self.open_settings)
         m.add_separator()
+        m.add_command(label="배포본 만들기…", command=self.make_pack)
         m.add_command(label="사용법 보기", command=self.open_guide)
         m.add_command(label="CSV 양식 저장…", command=self.save_templates)
         m.add_command(label="설정 폴더 열기", command=lambda: self._open_path(app_dir()))
@@ -1663,6 +1669,127 @@ class App:
         else:
             messagebox.showinfo(APP_NAME, f"이번 달 접속 이력이 아직 없습니다.\n{self.log.path()}")
 
+    # ----------------------------------------------------------- 배포본 ---
+
+    def make_pack(self):
+        """지금 설정·설비 목록·비밀번호를 넣은 exe 를 만든다 (빌드 도구 없이)."""
+        src = own_exe()
+        if not src:
+            messagebox.showinfo(APP_NAME, "배포본은 EquipmentRemote.exe 로 실행했을 때만 만들 수 있습니다.")
+            return
+        if not self._can_edit():
+            return
+        with_pw = [e.id for e in self.items if secret.AVAILABLE and self.passwords.has(e.id)]
+        dlg = PackDialog(self.root, self.cfg.equipment_file, len(self.items), len(with_pw))
+
+        def save(include_pw: bool, passphrase: str) -> bool:
+            dst = filedialog.asksaveasfilename(
+                parent=dlg.top, title="배포본 저장", defaultextension=".exe",
+                initialfile=f"설비원격접속_배포_{datetime.date.today():%Y%m%d}.exe",
+                filetypes=[("실행 파일", "*.exe")])
+            if not dst:
+                return False
+            equipment = None if self.cfg.equipment_file else {
+                "groups": list(self.store.groups), "items": [dataclasses.asdict(e) for e in self.items]}
+            passwords = None
+            if include_pw:
+                passwords = {i: p for i in with_pw if (p := self.passwords.get(i))}
+            try:
+                write_pack(src, dst, make_payload(dataclasses.asdict(self.cfg), equipment, passwords, passphrase))
+            except PackError as e:
+                messagebox.showerror(APP_NAME, str(e), parent=dlg.top)
+                return False
+            parts = ["공유 목록 경로" if self.cfg.equipment_file else f"설비 {len(self.items)}대",
+                     "뷰어 설정"] + ([f"비밀번호 {len(passwords)}대"] if passwords else [])
+            messagebox.showinfo(APP_NAME, (
+                f"배포본을 만들었습니다.\n{dst}\n\n들어 있는 것: {', '.join(parts)}\n\n"
+                "이 파일 하나를 나눠 주면, 받은 사람은 실행만 하면 같은 상태로 시작합니다."
+                + ("\n배포 암호는 따로(말이나 메신저로) 알려 주세요." if passwords and passphrase else "")),
+                parent=dlg.top)
+            return True
+
+        dlg.on_save = save
+
+    def _maybe_apply_pack(self, first_run: bool) -> bool:
+        """이 exe 가 배포본이면 넣어 둔 내용을 가져온다. 뷰어까지 준비되면 True."""
+        pack = read_pack(own_exe())
+        if not pack or not pack.get("id") or pack["id"] == self.local.applied_pack:
+            return False
+        eq = pack.get("equipment")
+        what = (f"설비 {len(eq.get('items', []))}대" if eq else "공유 목록 경로") + ", 뷰어 설정"
+        if pack.get("password_count"):
+            what += f", 비밀번호 {pack['password_count']}대"
+        if not first_run and not messagebox.askyesno(APP_NAME, (
+                f"이 파일은 배포본입니다. ({pack.get('made', '')}, {pack.get('by', '')})\n"
+                f"들어 있는 것: {what}\n\n지금 이 PC에 가져올까요?\n"
+                "설정은 배포본 것으로 바뀌고, 설비는 합쳐집니다. 즐겨찾기는 그대로입니다.")):
+            self.local.applied_pack = pack["id"]
+            self.local.save()
+            return False
+        ok = self._apply_pack(pack)
+        self.local.applied_pack = pack["id"]
+        self.local.save()
+        return ok
+
+    def _apply_pack(self, pack: dict) -> bool:
+        known = {f.name for f in dataclasses.fields(Config)}
+        cfg = Config(**{k: v for k, v in (pack.get("config") or {}).items() if k in known})
+        if not os.path.isfile(cfg.viewer_path):   # 받는 PC는 뷰어가 다른 곳에 깔렸을 수 있다
+            found = detect_viewer()
+            if found:
+                cfg.viewer_type, cfg.viewer_path = found
+        self.cfg = cfg
+        self._save_config()
+        self._open_store()
+        lines = []
+        eq = pack.get("equipment")
+        if eq:
+            try:
+                added, updated = self.store.merge(eq.get("items") or [], eq.get("groups") or [])
+                lines.append(f"설비 목록: 추가 {added}대, 바뀜 {updated}대")
+            except StoreError as e:
+                lines.append(f"설비 목록을 가져오지 못했습니다: {e}")
+        else:
+            lines.append(f"설비 목록: 공유 목록을 씁니다\n    {cfg.equipment_file}")
+        sealed = pack.get("passwords")
+        if sealed:
+            pw = self._unseal(sealed)
+            if pw is None:
+                lines.append("비밀번호: 가져오지 않았습니다 (배포 암호를 넣지 않음)")
+            elif not secret.AVAILABLE:
+                lines.append("비밀번호: Windows에서만 저장됩니다")
+            else:
+                try:
+                    self.passwords.set_many({str(k): str(v) for k, v in pw.items() if v})
+                    lines.append(f"비밀번호: {len(pw)}대 저장 (이 PC·이 계정에 암호화)")
+                except OSError as e:
+                    lines.append(f"비밀번호를 저장하지 못했습니다: {e}")
+        ok = os.path.isfile(cfg.viewer_path)
+        if not ok:
+            lines.append("\nVNC 뷰어를 찾지 못했습니다. 다음 설정 화면에서 뷰어 실행 파일을 지정하세요.")
+        messagebox.showinfo(APP_NAME, "배포본의 설정을 가져왔습니다.\n\n" + "\n".join(lines))
+        return ok
+
+    def _unseal(self, sealed: dict) -> dict | None:
+        if not sealed.get("passphrase"):
+            try:
+                return unseal(sealed, "")
+            except ValueError:
+                return None
+        for _ in range(3):
+            phrase = simpledialog.askstring(
+                "배포 암호", "이 배포본의 VNC 비밀번호는 배포 암호로 잠겨 있습니다.\n"
+                             "배포한 사람에게 받은 암호를 입력하세요. (취소하면 비밀번호 없이 시작)",
+                show="*", parent=self.root)
+            if phrase is None:
+                return None
+            try:
+                return unseal(sealed, phrase)
+            except ValueError:
+                messagebox.showwarning(APP_NAME, HANGUL_PHRASE if not phrase.isascii()
+                                       else "배포 암호가 맞지 않습니다.")
+        return None
+
     def open_guide(self):
         """exe 안에 넣어 둔 사용법을 임시 폴더에 꺼내 메모장으로 연다."""
         try:
@@ -2041,6 +2168,64 @@ class SettingsDialog(_Dialog):
             auto_check_minutes=self.auto_choices.get(self.auto.get(), self.cfg.auto_check_minutes),
             connection_log=self.log_on.get())
         if self.on_save and self.on_save(cfg):
+            self.top.destroy()
+
+
+class PackDialog(_Dialog):
+    """배포본 만들기: 무엇을 넣을지, 배포 암호."""
+
+    def __init__(self, parent, shared: str, n_items: int, n_pw: int):
+        super().__init__(parent, "배포본 만들기")
+        b = self.body
+        self.include_pw = tk.BooleanVar(value=n_pw > 0)
+        self.phrase = tk.StringVar()
+        self.again = tk.StringVar()
+        ttk.Label(b, foreground=SUB, justify="left", text=(
+            "지금 이 PC의 설정과 설비 목록, VNC 비밀번호를 넣은 exe 를 만듭니다.\n"
+            "받은 사람은 그 exe 를 실행만 하면 같은 상태로 시작합니다.")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self._row = 1
+        self.field("설비 목록", ttk.Label(b, text=(f"공유 목록 경로를 넣습니다: {shared}" if shared
+                                                 else f"지금 목록 {n_items}대를 복사해 넣습니다")))
+        self.field("뷰어 설정", ttk.Label(b, text="넣습니다 (받는 PC에서 뷰어 위치가 다르면 자동으로 찾습니다)"))
+        pw = ttk.Checkbutton(b, text=f"VNC 비밀번호 넣기 (저장된 {n_pw}대)", variable=self.include_pw,
+                             command=self._sync)
+        if not n_pw:
+            pw["state"] = "disabled"
+        self.field("비밀번호", pw)
+        self.phrase_entry = ttk.Entry(b, textvariable=self.phrase, show="*", width=24)
+        self.field("배포 암호", self.phrase_entry,
+                   "정하면 받은 사람이 처음 실행할 때 이 암호를 넣어야 비밀번호가 풀립니다 (영문·숫자)")
+        self.again_entry = ttk.Entry(b, textvariable=self.again, show="*", width=24)
+        self.field("배포 암호 확인", self.again_entry)
+        ttk.Label(b, foreground=ALERT_TEXT, justify="left", text=(
+            "배포 암호 없이 비밀번호를 넣으면, 이 exe 를 가진 사람은 누구나 비밀번호를 꺼낼 수 있습니다.\n"
+            "부서 밖으로 나가지 않게 주의하세요.")).grid(row=self._row, column=0, columnspan=2,
+                                                       sticky="w", pady=(6, 0))
+        self._row += 1
+        self._sync()
+        self.buttons("만들기")
+
+    def _sync(self):
+        state = "normal" if self.include_pw.get() else "disabled"
+        self.phrase_entry["state"] = state
+        self.again_entry["state"] = state
+
+    def submit(self):
+        include = self.include_pw.get()
+        phrase = self.phrase.get() if include else ""
+        if include:
+            if phrase and not phrase.isascii():
+                messagebox.showwarning(APP_NAME, HANGUL_PHRASE, parent=self.top)
+                return
+            if phrase != self.again.get():
+                messagebox.showwarning(APP_NAME, "배포 암호 두 칸이 서로 다릅니다.", parent=self.top)
+                return
+            if not phrase and not messagebox.askyesno(
+                    APP_NAME, "배포 암호 없이 만들면, 이 exe 를 가진 사람은 누구나 VNC 비밀번호를 꺼낼 수 있습니다.\n\n"
+                              "그래도 만들까요?", icon="warning", default="no", parent=self.top):
+                return
+        if self.on_save and self.on_save(include, phrase):
             self.top.destroy()
 
 
