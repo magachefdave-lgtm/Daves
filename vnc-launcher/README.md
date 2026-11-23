@@ -15,6 +15,7 @@
 | `launcher/core.py` | 설비 목록 저장(편집 잠금, 날짜별 백업 포함), CSV, 설정, VNC·RDP 명령 구성 |
 | `launcher/local.py` | 이 PC에만 남기는 것: 즐겨찾기, 최근 접속, 창 크기·위치, 마지막 그룹 |
 | `launcher/pack.py` | 배포본: 설정·목록·비밀번호(배포 암호로 다시 암호화)를 exe 끝에 붙인다. `더보기 > 배포본 만들기` |
+| `launcher/update.py` | 서버(공유) 폴더를 통한 업데이트: 올리기(`latest.json` + exe), 확인, 받아서 바꾸고 다시 켜기 |
 | `launcher/history.py` | 접속 이력 (설비 목록 옆에 달마다 CSV) |
 | `launcher/secret.py` | VNC 비밀번호 보관 (Windows DPAPI) |
 | `launcher/wintitle.py` | Windows 창 다루기: 뷰어 창 제목, 창 앞으로 가져오기, 화면 크기 |

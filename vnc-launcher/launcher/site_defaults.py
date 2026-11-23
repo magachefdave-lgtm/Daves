@@ -5,3 +5,7 @@ SHARED_EQUIPMENT_FILE 에 부서 공유 설비 목록 경로를 적고 빌드하
 예: r"\\\\fileserver\\설비팀\\원격접속\\equipment.json"
 """
 SHARED_EQUIPMENT_FILE = ""
+
+# 업데이트 폴더: 관리자가 [더보기 > 업데이트 올리기]로 새 버전을 올리는 서버(공유) 폴더.
+# 예: r"\\fileserver\설비팀\원격접속\update"
+UPDATE_FOLDER = ""

@@ -76,22 +76,11 @@ def write_pack(src_exe: str, dst: str, payload: dict) -> None:
     """src_exe 를 복사하고 끝에 payload 를 붙인다. src 에 이미 붙어 있던 것은 떼고 붙인다."""
     if os.path.abspath(src_exe) == os.path.abspath(dst):
         raise PackError("지금 실행 중인 파일에는 덮어쓸 수 없습니다. 다른 이름으로 저장하세요.")
-    found = _find(src_exe)
     body = json.dumps({**payload, "format": 1}, ensure_ascii=False).encode("utf-8")
     tmp = dst + ".tmp"
     try:
         with open(src_exe, "rb") as src, open(tmp, "wb") as out:
-            limit = found[0] if found else None
-            if limit is None:
-                shutil.copyfileobj(src, out)
-            else:
-                remaining = limit
-                while remaining:
-                    chunk = src.read(min(1 << 20, remaining))
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    remaining -= len(chunk)
+            _copy_body(src_exe, src, out)
             out.write(MAGIC + body + len(body).to_bytes(8, "big") + TRAILER)
         os.replace(tmp, dst)
     except OSError as e:
@@ -100,6 +89,27 @@ def write_pack(src_exe: str, dst: str, payload: dict) -> None:
         except OSError:
             pass
         raise PackError(f"배포본을 저장하지 못했습니다.\n{dst}\n({e})") from e
+
+
+def _copy_body(path: str, src, out) -> None:
+    """exe 의 본래 부분만 복사한다 (붙어 있는 배포본 내용은 뺀다)."""
+    found = _find(path)
+    if found is None:
+        shutil.copyfileobj(src, out)
+        return
+    remaining = found[0]
+    while remaining:
+        chunk = src.read(min(1 << 20, remaining))
+        if not chunk:
+            break
+        out.write(chunk)
+        remaining -= len(chunk)
+
+
+def strip_pack(src_exe: str, dst: str) -> None:
+    """배포본에서 붙은 내용을 뗀 순수한 exe 를 dst 에 쓴다 (배포본이 아니면 그대로 복사)."""
+    with open(src_exe, "rb") as src, open(dst, "wb") as out:
+        _copy_body(src_exe, src, out)
 
 
 # ------------------------------------------------------------ 비밀번호 봉인 ---

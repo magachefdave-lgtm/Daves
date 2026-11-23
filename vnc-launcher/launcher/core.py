@@ -597,6 +597,7 @@ class Config:
     show_rdp: bool = False         # 원격 데스크톱(RDP) 버튼을 화면에 보일지 (전체)
     auto_check_minutes: int = 1    # 몇 분마다 상태를 다시 확인할지 (0 = 하지 않음)
     connection_log: bool = True    # 접속 이력을 남길지
+    update_folder: str = ""        # 새 버전을 받아 올 서버(공유) 폴더. 비우면 업데이트를 확인하지 않는다
 
     def quiet_args(self) -> list[str]:
         if not self.quiet_connect or self.viewer_type == "custom":
@@ -711,6 +712,7 @@ def load_config(path: str) -> Config:
     cfg.quiet_connect = _to_bool(g("viewer", "quiet_connect", "yes"))
     cfg.show_rdp = _to_bool(g("ui", "show_rdp_button", "no"))
     cfg.connection_log = _to_bool(g("data", "connection_log", "yes"))
+    cfg.update_folder = g("data", "update_folder", "").strip('"')
     try:
         cfg.check_timeout = min(10.0, max(0.3, float(g("status", "timeout_seconds", "1.5"))))
     except ValueError:
@@ -746,6 +748,8 @@ quiet_connect = {"yes" if cfg.quiet_connect else "no"}
 equipment_file = {cfg.equipment_file}
 ; 접속 이력을 설비 목록 파일과 같은 폴더에 달마다 CSV로 남길지 (yes / no)
 connection_log = {"yes" if cfg.connection_log else "no"}
+; 새 버전을 받아 올 서버(공유) 폴더. 예: \\\\서버\\공유\\원격접속\\update  (비우면 업데이트 확인 안 함)
+update_folder = {cfg.update_folder}
 
 [ui]
 ; 설비 버튼에 공유폴더 아이콘을 보일지 (yes / no). no 로 하면 모든 설비에서 사라집니다.

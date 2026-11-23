@@ -25,7 +25,8 @@ from .core import (BACKUP_KEEP, CAUTION_MAX, CAUTION_PRESETS, OS_CHOICES, OS_WIN
 from .history import ConnectionLog
 from .local import LocalState, fit_geometry, quick_ids
 from .pack import PackError, make_payload, own_exe, read_pack, unseal, write_pack
-from .site_defaults import SHARED_EQUIPMENT_FILE
+from .site_defaults import SHARED_EQUIPMENT_FILE, UPDATE_FOLDER
+from .update import UpdateError, cleanup_old, install, is_newer, publish, read_latest, relaunch
 
 GUIDE = "시작하기.txt"                                   # exe 안에 넣어 두는 사용법
 TEMPLATES = ("설비목록_예시.csv", "비밀번호_예시.csv")    # exe 안에 넣어 두는 CSV 양식
@@ -269,10 +270,15 @@ class App:
             if found:
                 self.cfg.viewer_type, self.cfg.viewer_path = found
             self.cfg.equipment_file = SHARED_EQUIPMENT_FILE
+            self.cfg.update_folder = UPDATE_FOLDER
             self._save_config()
         self.passwords = secret.PasswordStore(os.path.join(app_dir(), "passwords.json"))
         self._open_store()
         pack_ok = self._maybe_apply_pack(first_run)   # 배포본이면 넣어 둔 설정을 가져온다
+        cleanup_old(own_exe())                         # 지난 업데이트에서 남은 예전 exe
+        self.update_info: dict | None = None           # 서버에 있는 새 버전 정보
+        self._update_result = None                     # 일꾼 스레드가 남긴 확인 결과
+        self.check_update(manual=False)
         self.group = self.local.group or ALL_GROUPS
         self._restore_window()
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -353,6 +359,9 @@ class App:
         # 응답 없는 설비 수 - 있을 때만 빨갛게 나타나고, 누르면 그 설비만 보인다.
         self.alert_btn = PillButton(row1, "", self.toggle_only_down, self.f_group,
                                     (ALERT, ALERT_DARK, "#ffffff"), HEAD)
+        # 새 버전이 있을 때만 나타난다 (파랑 - 누르면 업데이트)
+        self.update_btn = PillButton(row1, "", self.start_update, self.f_group,
+                                     (ACCENT, ACCENT_DARK, "#ffffff"), HEAD)
 
         # 그룹 줄. 오른쪽 끝에는 지금 접속해 있는 설비가 나온다.
         self.chips = tk.Canvas(root, bg=BG, height=28, highlightthickness=0)
@@ -448,6 +457,8 @@ class App:
         m.add_command(label="설정", command=self.open_settings)
         m.add_separator()
         m.add_command(label="배포본 만들기…", command=self.make_pack)
+        m.add_command(label="업데이트 확인", command=lambda: self.check_update(manual=True))
+        m.add_command(label="업데이트 올리기…", command=self.publish_update)
         m.add_command(label="사용법 보기", command=self.open_guide)
         m.add_command(label="CSV 양식 저장…", command=self.save_templates)
         m.add_command(label="설정 폴더 열기", command=lambda: self._open_path(app_dir()))
@@ -1710,6 +1721,118 @@ class App:
 
         dlg.on_save = save
 
+    # ---------------------------------------------------------- 업데이트 ---
+
+    def check_update(self, manual: bool):
+        """업데이트 폴더의 latest.json 을 일꾼 스레드에서 읽는다 (공유 폴더가 느려도 화면이 멈추지 않게)."""
+        folder = self.cfg.update_folder
+        if not folder:
+            if manual:
+                messagebox.showinfo(APP_NAME, "업데이트 폴더가 정해지지 않았습니다.\n"
+                                              "[더보기 > 설정]에서 '업데이트 폴더'를 지정하세요.")
+            return
+
+        def work():
+            try:
+                self._update_result = (read_latest(folder), None, manual)
+            except UpdateError as e:
+                self._update_result = (None, str(e), manual)
+
+        self.pool.submit(work)
+
+    def _update_checked(self, info: dict | None, error: str | None, manual: bool):
+        newer = bool(info) and is_newer(info["version"], APP_VERSION)
+        self.update_info = info if newer else None
+        if newer:
+            self.update_btn.set_text(f"업데이트  v{info['version']}")
+            if not self.update_btn.winfo_manager():
+                self.update_btn.pack(side="right", padx=(0, 6))
+            self.toast(f"새 버전 v{info['version']}이 있습니다. 위쪽의 [업데이트]를 누르세요.")
+        else:
+            self.update_btn.pack_forget()
+        if manual:
+            if error:
+                messagebox.showwarning(APP_NAME, error)
+            elif newer:
+                self.start_update()
+            else:
+                messagebox.showinfo(APP_NAME, f"최신 버전입니다. (지금 v{APP_VERSION}"
+                                    + (f", 서버 v{info['version']})" if info else ", 서버에 올린 버전 없음)"))
+
+    def start_update(self):
+        info = self.update_info
+        if not info:
+            return
+        exe = own_exe()
+        if not exe:
+            messagebox.showinfo(APP_NAME, "업데이트는 EquipmentRemote.exe 로 실행했을 때만 됩니다.")
+            return
+        notes = f"\n\n바뀐 점:\n{info['notes']}" if info.get("notes") else ""
+        if not messagebox.askyesno(APP_NAME, (
+                f"v{APP_VERSION} → v{info['version']} 로 업데이트할까요?{notes}\n\n"
+                "프로그램이 잠깐 꺼졌다가 새 버전으로 다시 켜집니다. 설정·즐겨찾기·비밀번호는 그대로입니다."
+                + ("\n\n열려 있는 VNC 창은 그대로 둡니다." if self.sessions else ""))):
+            return
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            target = install(self.cfg.update_folder, info, exe, app_dir())
+        except UpdateError as e:
+            self.root.configure(cursor="")
+            messagebox.showerror(APP_NAME, str(e))
+            return
+        if os.path.abspath(target) != os.path.abspath(exe):
+            messagebox.showinfo(APP_NAME, (
+                "지금 exe 가 있는 폴더에는 쓸 수 없어서, 새 버전을 아래에 받았습니다.\n"
+                f"{target}\n\n앞으로는 이 파일로 실행하세요. (바탕화면 바로가기를 이 파일로 바꾸면 편합니다)"))
+        try:
+            relaunch(target)
+        except OSError as e:
+            self.root.configure(cursor="")
+            messagebox.showerror(APP_NAME, f"새 버전을 켜지 못했습니다. 직접 실행하세요.\n{target}\n({e})")
+            return
+        self.close()
+
+    def publish_update(self):
+        """지금 실행 중인 exe 를 새 버전으로 업데이트 폴더에 올린다 (관리자)."""
+        exe = own_exe()
+        if not exe:
+            messagebox.showinfo(APP_NAME, "업데이트 올리기는 EquipmentRemote.exe 로 실행했을 때만 됩니다.")
+            return
+        folder = self.cfg.update_folder
+        if not folder:
+            messagebox.showinfo(APP_NAME, "먼저 [더보기 > 설정]에서 '업데이트 폴더'를 지정하세요.")
+            return
+        if not self._can_edit():
+            return
+        try:
+            current = read_latest(folder)
+        except UpdateError as e:
+            if not messagebox.askyesno(APP_NAME, f"{e}\n\n그래도 이 폴더에 올릴까요?", default="no"):
+                return
+            current = None
+        if current and not is_newer(APP_VERSION, current["version"]) and not messagebox.askyesno(
+                APP_NAME, f"서버에는 이미 v{current['version']}이 있습니다. 지금 것은 v{APP_VERSION} 입니다.\n\n"
+                          "그래도 올릴까요? (받는 PC들은 서버 것이 지금 것보다 새것일 때만 업데이트합니다)",
+                icon="warning", default="no"):
+            return
+        notes = simpledialog.askstring("업데이트 올리기", f"v{APP_VERSION} 을(를) 올립니다.\n{folder}\n\n"
+                                       "바뀐 점을 짧게 적으세요. (받는 사람에게 보입니다, 비워도 됩니다)",
+                                       parent=self.root)
+        if notes is None:
+            return
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            info = publish(exe, folder, APP_VERSION, notes)
+        except UpdateError as e:
+            messagebox.showerror(APP_NAME, str(e))
+            return
+        finally:
+            self.root.configure(cursor="")
+        messagebox.showinfo(APP_NAME, f"v{info['version']}을(를) 올렸습니다.\n{folder}\n\n"
+                                      "각 PC는 프로그램을 켤 때(또는 [더보기 > 업데이트 확인]) 업데이트 버튼이 보입니다.")
+
     def _maybe_apply_pack(self, first_run: bool) -> bool:
         """이 exe 가 배포본이면 넣어 둔 내용을 가져온다. 뷰어까지 준비되면 True."""
         pack = read_pack(own_exe())
@@ -1845,6 +1968,7 @@ class App:
             self.status.clear()
             self.checked_at = ""
             self._show_hint()
+            self.check_update(manual=False)
             if self.reload():
                 self.check_status()
             return True
@@ -1894,6 +2018,10 @@ class App:
                 self.status[eq_id] = ok
         if changed:
             self.draw()
+        if self._update_result is not None:   # 업데이트 확인이 끝났다 (일꾼 스레드)
+            info, error, manual = self._update_result
+            self._update_result = None
+            self._update_checked(info, error, manual)
         if got and self.pending <= 0:   # 한 번의 확인이 끝났다
             self.pending = 0
             self.last_check = time.monotonic()
@@ -2056,6 +2184,7 @@ class SettingsDialog(_Dialog):
         self.cargs = tk.StringVar(value=cfg.custom_args)
         self.cpw = tk.StringVar(value=cfg.custom_pw_args)
         self.efile = tk.StringVar(value=cfg.equipment_file)
+        self.ufolder = tk.StringVar(value=cfg.update_folder)
         self.check = tk.BooleanVar(value=cfg.check_on_start)
         self.show_share = tk.BooleanVar(value=cfg.show_share)
         self.show_rdp = tk.BooleanVar(value=cfg.show_rdp)
@@ -2086,6 +2215,10 @@ class SettingsDialog(_Dialog):
         ttk.Button(row2, text="찾기", width=6, command=self._browse_file).pack(side="left", padx=(4, 0))
         self.field("설비 목록 파일", row2,
                    "비우면 이 PC에만 둡니다. 공유 폴더 경로를 넣으면 부서가 같은 목록을 같이 씁니다")
+        row3 = ttk.Frame(b)
+        ttk.Entry(row3, textvariable=self.ufolder).pack(side="left", fill="x", expand=True)
+        ttk.Button(row3, text="찾기", width=6, command=self._browse_update).pack(side="left", padx=(4, 0))
+        self.field("업데이트 폴더", row3, "관리자가 새 버전을 올리는 서버 폴더. 비우면 업데이트를 확인하지 않습니다")
 
         opts = ttk.Frame(b)
 
@@ -2141,6 +2274,11 @@ class SettingsDialog(_Dialog):
         if path:
             self.efile.set(os.path.normpath(path))
 
+    def _browse_update(self):
+        path = filedialog.askdirectory(parent=self.top, title="업데이트 폴더")
+        if path:
+            self.ufolder.set(os.path.normpath(path))
+
     def _detect(self):
         found = detect_viewer()
         if found:
@@ -2166,7 +2304,7 @@ class SettingsDialog(_Dialog):
             show_share=self.show_share.get(), title_with_name=self.title_name.get(),
             quiet_connect=self.quiet.get(), show_rdp=self.show_rdp.get(),
             auto_check_minutes=self.auto_choices.get(self.auto.get(), self.cfg.auto_check_minutes),
-            connection_log=self.log_on.get())
+            connection_log=self.log_on.get(), update_folder=self.ufolder.get().strip().strip('"'))
         if self.on_save and self.on_save(cfg):
             self.top.destroy()
 

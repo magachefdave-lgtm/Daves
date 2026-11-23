@@ -67,6 +67,22 @@ if __name__ == "__main__":
             with open(out, "w", encoding="utf-8") as f:
                 json.dump({"pack": info}, f, ensure_ascii=False)
             sys.exit(0)
+        if "--version-out" in sys.argv[1:]:   # 빌드 검사용: 이 exe 가 켜지는지
+            from launcher import APP_VERSION
+            with open(sys.argv[sys.argv.index("--version-out") + 1], "w", encoding="utf-8") as f:
+                f.write(APP_VERSION)
+            sys.exit(0)
+        if "--install-update" in sys.argv[1:]:   # 빌드 검사용: 업데이트 설치 + 새 exe 다시 켜기
+            import json
+            from launcher import core
+            from launcher.update import install, read_latest, relaunch
+            args = sys.argv[1:]
+            folder, out = args[args.index("--install-update") + 1], args[args.index("--result") + 1]
+            target = install(folder, read_latest(folder), sys.executable, core.app_dir())
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump({"installed": target, "old_exists": os.path.exists(target + ".old")}, f)
+            relaunch(target, ("--version-out", out + ".relaunched"))
+            sys.exit(0)
         if "--reset-pin" in sys.argv[1:]:
             reset_pin()
             sys.exit(0)

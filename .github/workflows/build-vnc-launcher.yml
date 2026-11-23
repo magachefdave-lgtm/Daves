@@ -41,6 +41,19 @@ jobs:
           Start-Process -Wait -FilePath .\dist\EquipmentRemote.exe -ArgumentList '--pack-info','plaininfo.json'
           python -c "import json; p=json.load(open('packinfo.json',encoding='utf-8'))['pack']; n=json.load(open('plaininfo.json',encoding='utf-8'))['pack']; assert p and p['items']==1 and p['password_count']==1, p; assert n is None, n; print('deploy package ok', p)"
           Remove-Item packcheck.exe, packinfo.json, plaininfo.json
+      # 업데이트: 실행 중인 exe 가 자기 이름을 바꾸고 새 exe 를 놓은 뒤, 새 exe 를 다시 켜는지 실제로 돌려 본다
+      - name: Check self-update works on Windows
+        timeout-minutes: 5
+        run: |
+          New-Item -ItemType Directory -Force updtest\app | Out-Null
+          Copy-Item dist\EquipmentRemote.exe updtest\app\EquipmentRemote.exe
+          python -c "from launcher.update import publish; publish('dist/EquipmentRemote.exe', 'updtest/server', '99.0.0', 'ci')"
+          $u = (Resolve-Path updtest).Path
+          Start-Process -Wait -FilePath "$u\app\EquipmentRemote.exe" -ArgumentList '--install-update',"$u\server",'--result',"$u\result.json"
+          for ($i = 0; $i -lt 90 -and -not (Test-Path "$u\result.json.relaunched")); $i++) { Start-Sleep -Seconds 1 }
+          python -c "import json; r=json.load(open('updtest/result.json')); assert r['old_exists'], r; v=open('updtest/result.json.relaunched').read(); assert v, v; print('self-update ok', r, 'relaunched', v)"
+          Start-Sleep -Seconds 3
+          Remove-Item -Recurse -Force updtest
       - uses: actions/upload-artifact@v4
         with:
           name: EquipmentRemote
