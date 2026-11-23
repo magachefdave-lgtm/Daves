@@ -20,7 +20,7 @@ from .core import (BACKUP_KEEP, CAUTION_MAX, CAUTION_PRESETS, OS_CHOICES, OS_WIN
                    VIEWERS, Config, Equipment, EquipmentStore, StoreError, app_dir, build_command,
                    resource_path,
                    check_pin, detect_viewer, equipment_file, export_csv, has_rdp, has_share,
-                   is_reachable, load_config, natural_key, rdp_command, read_csv, save_config,
+                   CHECK_METHODS, check_method, is_reachable, ping, load_config, natural_key, rdp_command, read_csv, save_config,
                    share_path)
 from .history import ConnectionLog
 from .local import LocalState, fit_geometry, quick_ids
@@ -970,8 +970,9 @@ class App:
             word = STATUS_WORD.get(st, "상태 미확인")
             if mine:
                 word = "접속 중" if any(s["connected"] for s in mine) else "접속 시도 중"
+            how = {"ping": " (ping)", "off": " (확인 안 함)"}.get(check_method(eq), "")
             parts = [eq.name, eq.host if eq.port == 5900 else f"{eq.host}:{eq.port}", eq.os,
-                     eq.group or NO_GROUP, word, f"▲ {eq.caution}" if eq.caution else "", eq.memo]
+                     eq.group or NO_GROUP, word + how, f"▲ {eq.caution}" if eq.caution else "", eq.memo]
             self.foot_var.set("   ·   ".join(p for p in parts if p))
 
     def _on_motion(self, _event):
@@ -1984,18 +1985,24 @@ class App:
             return
         timeout = self.cfg.check_timeout
         for e in items:
+            method = check_method(e)
+            if method == "off":   # 확인하지 않는 설비: 상태를 비워 둔다 (미확인)
+                self.status.pop(e.id, None)
+                continue
             if not quiet and self.status.get(e.id) is None:
                 self.status[e.id] = "busy"
             self.pending += 1
-            self.pool.submit(self._probe, e.id, e.host, e.port, timeout)
+            self.pool.submit(self._probe, e.id, e.host, e.port, timeout, method)
+        if not self.pending:
+            return
         if not quiet:
             self.check_btn.set_enabled(False, "확인 중…")
             self.draw()
 
-    def _probe(self, eq_id: str, host: str, port: int, timeout: float):
+    def _probe(self, eq_id: str, host: str, port: int, timeout: float, method: str = "port"):
         """일꾼 스레드에서 돈다. 무슨 일이 있어도 결과를 하나 남겨야 확인이 끝난다."""
         try:
-            ok = is_reachable(host, port, timeout)
+            ok = ping(host, timeout) if method == "ping" else is_reachable(host, port, timeout)
         except Exception:
             ok = False
         self.results.put((eq_id, host, port, ok))
@@ -2099,6 +2106,7 @@ class EquipmentDialog(_Dialog):
         self.share = tk.StringVar(value=eq.share)
         self.memo = tk.StringVar(value=eq.memo)
         self.caution = tk.StringVar(value=eq.caution)
+        self.check = tk.StringVar(value=CHECK_METHODS[eq.check])
         self.share_on = tk.BooleanVar(value=eq.share_enabled)
         self.rdp_on = tk.BooleanVar(value=eq.rdp_enabled)
         self.pw = tk.StringVar()
@@ -2125,6 +2133,9 @@ class EquipmentDialog(_Dialog):
         self.field("주의 표시", ttk.Combobox(b, textvariable=self.caution, values=("",) + CAUTION_PRESETS),
                    "예: PM 중. 적어 두면 버튼에 ▲ 표시가 붙고, 접속할 때 한 번 더 묻습니다")
         self.field("메모", ttk.Entry(b, textvariable=self.memo))
+        self.field("상태 확인", ttk.Combobox(b, textvariable=self.check, values=list(CHECK_METHODS.values()),
+                                          state="readonly"),
+                   "리눅스 VNC 서버는 포트 확인을 실패로 세어 접속을 막으므로 ping 으로 확인합니다")
         if secret.AVAILABLE:
             if not pw_supported:
                 hint = "지금 설정된 뷰어는 비밀번호 자동 입력을 지원하지 않습니다."
@@ -2155,7 +2166,8 @@ class EquipmentDialog(_Dialog):
             "host": self.host.get(), "port": self.port.get() or "5900", "os": self.os.get(),
             "share": self.share.get() if is_win else "", "memo": self.memo.get(),
             "share_enabled": self.share_on.get(), "caution": self.caution.get(),
-            "rdp_enabled": self.rdp_on.get()})
+            "rdp_enabled": self.rdp_on.get(),
+            "check": next(k for k, v in CHECK_METHODS.items() if v == self.check.get())})
         password = None  # None = 건드리지 않음
         if self.pw_clear.get():
             password = ""

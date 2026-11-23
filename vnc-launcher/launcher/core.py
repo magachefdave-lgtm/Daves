@@ -12,7 +12,10 @@ import os
 import re
 import shutil
 import socket
+import struct
+import subprocess
 import sys
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 
@@ -20,7 +23,15 @@ OS_WINDOWS = "Windows"
 OS_CHOICES = (OS_WINDOWS, "Linux", "기타")
 DEFAULT_PORT = 5900
 
-CSV_COLUMNS = ("설비명", "그룹", "IP", "포트", "OS", "공유폴더", "메모", "공유폴더사용", "주의", "RDP사용")
+CSV_COLUMNS = ("설비명", "그룹", "IP", "포트", "OS", "공유폴더", "메모", "공유폴더사용", "주의", "RDP사용", "상태확인")
+
+# 상태 확인 방식. 리눅스의 TigerVNC·RealVNC 서버는 로그인 없이 끊긴 연결도 "보안 실패"로 세어
+# 5번이면 그 PC 를 막는다 ("Too many security failures", 막는 시간은 10초부터 두 배씩).
+# 1분마다 VNC 포트를 두드리면 리눅스 설비가 늘 막혀 있게 되므로, 리눅스는 ping 으로 확인한다.
+CHECK_METHODS = {"auto": "자동 (Windows=VNC 포트, Linux=ping)", "port": "VNC 포트",
+                 "ping": "ping", "off": "하지 않음"}
+_CHECK_WORDS = {"자동": "auto", "auto": "auto", "포트": "port", "vnc포트": "port", "port": "port",
+                "ping": "ping", "핑": "ping", "안함": "off", "하지않음": "off", "끔": "off", "off": "off"}
 CAUTION_PRESETS = ("PM 중", "점검 중", "고장", "접속 금지")
 CAUTION_MAX = 30
 BACKUP_KEEP = 14        # 날짜별 백업을 며칠치 남길지
@@ -52,6 +63,7 @@ class Equipment:
     share_enabled: bool = True   # False = 이 설비에는 공유폴더 버튼을 보이지 않는다
     caution: str = ""            # 주의 표시 (예: PM 중). 있으면 접속할 때 한 번 더 묻는다
     rdp_enabled: bool = True     # False = 이 설비에는 원격 데스크톱 버튼을 보이지 않는다
+    check: str = "auto"          # 상태 확인 방식: auto / port / ping / off (CHECK_METHODS)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @classmethod
@@ -67,6 +79,7 @@ class Equipment:
             share_enabled=_to_bool(d.get("share_enabled", True)),
             caution=" ".join(str(d.get("caution", "")).split())[:CAUTION_MAX],
             rdp_enabled=_to_bool(d.get("rdp_enabled", True)),
+            check=_CHECK_WORDS.get(str(d.get("check", "auto")).strip().replace(" ", "").lower(), "auto"),
             id=str(d.get("id") or uuid.uuid4().hex),
         )
 
@@ -96,6 +109,13 @@ def has_share(eq: "Equipment") -> bool:
 def has_rdp(eq: "Equipment") -> bool:
     """원격 데스크톱 버튼을 쓸 수 있는 설비인지."""
     return eq.os == OS_WINDOWS and eq.rdp_enabled
+
+
+def check_method(eq: "Equipment") -> str:
+    """이 설비의 상태를 실제로 어떻게 확인할지: port / ping / off."""
+    if eq.check != "auto":
+        return eq.check
+    return "ping" if eq.os == "Linux" else "port"
 
 
 def rdp_command(eq: "Equipment") -> list[str]:
@@ -474,6 +494,7 @@ _CSV_KEYS = {
     "공유폴더사용": "share_enabled", "공유폴더버튼": "share_enabled",
     "주의": "caution", "주의표시": "caution", "caution": "caution",
     "rdp사용": "rdp_enabled", "원격데스크톱사용": "rdp_enabled", "rdp": "rdp_enabled",
+    "상태확인": "check", "확인방식": "check", "check": "check",
     "비밀번호": "password", "vnc비밀번호": "password", "암호": "password",
     "password": "password", "pw": "password",
 }
@@ -518,7 +539,8 @@ def export_csv(items: list[Equipment], csv_path: str) -> None:
             for e in items:
                 w.writerow([e.name, e.group, e.host, e.port, e.os, e.share, e.memo,
                             "Y" if e.share_enabled else "N", e.caution,
-                            "Y" if e.rdp_enabled else "N"])
+                            "Y" if e.rdp_enabled else "N",
+                            {"auto": "자동", "port": "포트", "ping": "ping", "off": "안함"}[e.check]])
     except OSError as e:
         raise StoreError(
             f"CSV 파일을 저장할 수 없습니다.\n{csv_path}\n\n"
@@ -638,6 +660,87 @@ def is_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
             return True
     except (OSError, ValueError, OverflowError):   # 잘못 적힌 주소·포트도 "응답 없음"
         return False
+
+
+def ping(host: str, timeout: float = 1.5) -> bool:
+    """ICMP 응답(ping)이 오는지. VNC 서버를 건드리지 않으므로 서버가 이 PC 를 막을 일이 없다."""
+    try:
+        ip = socket.gethostbyname(host)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    try:
+        if sys.platform == "win32":
+            return _ping_windows(ip, timeout)
+        return _ping_other(ip, timeout)
+    except Exception:   # 어떤 이유로든 확인하지 못하면 "응답 없음"
+        return False
+
+
+def _ping_windows(ip: str, timeout: float) -> bool:
+    """Windows 의 IcmpSendEcho 를 직접 부른다 - 관리자 권한도, ping.exe 창도 필요 없다."""
+    import ctypes
+    from ctypes import wintypes
+    api = ctypes.WinDLL("iphlpapi")
+    api.IcmpCreateFile.restype = wintypes.HANDLE
+    api.IcmpCloseHandle.argtypes = [wintypes.HANDLE]
+    api.IcmpSendEcho.argtypes = [wintypes.HANDLE, ctypes.c_ulong, ctypes.c_void_p, wintypes.WORD,
+                                 ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+    api.IcmpSendEcho.restype = wintypes.DWORD
+    handle = api.IcmpCreateFile()
+    if not handle or handle == ctypes.c_void_p(-1).value:
+        return False
+    try:
+        data = b"EquipmentRemote"
+        reply = ctypes.create_string_buffer(256)
+        addr = struct.unpack("<I", socket.inet_aton(ip))[0]   # 메모리에 네트워크 순서 그대로
+        n = api.IcmpSendEcho(handle, addr, data, len(data), None, reply, len(reply), int(timeout * 1000))
+        # ICMP_ECHO_REPLY: Address(4) Status(4) ... Status 0 = 응답 받음 (중간 라우터의 "도달 불가"는 아님)
+        return n > 0 and struct.unpack_from("<I", reply.raw, 4)[0] == 0
+    finally:
+        api.IcmpCloseHandle(handle)
+
+
+def _ping_other(ip: str, timeout: float) -> bool:
+    """Windows 가 아닐 때 (개발·시험용): ping 명령, 없으면 ICMP 소켓."""
+    try:
+        r = subprocess.run(["ping", "-c", "1", "-W", str(max(1, round(timeout))), ip],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=timeout + 2)
+        return r.returncode == 0
+    except FileNotFoundError:
+        pass
+    for kind in (socket.SOCK_DGRAM, socket.SOCK_RAW):   # 권한 없는 ICMP, 안 되면 raw (관리자)
+        try:
+            s = socket.socket(socket.AF_INET, kind, socket.IPPROTO_ICMP)
+        except OSError:
+            continue
+        with s:
+            ident = os.getpid() & 0xFFFF
+            body = b"EquipmentRemote"
+            head = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
+            csum = _checksum(head + body)
+            s.settimeout(timeout)
+            s.sendto(struct.pack("!BBHHH", 8, 0, csum, ident, 1) + body, (ip, 0))
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                try:
+                    pkt, (src, _p) = s.recvfrom(1024)
+                except OSError:
+                    return False
+                icmp = pkt[20:] if kind == socket.SOCK_RAW else pkt
+                if src == ip and icmp[:1] == b"\x00":   # echo reply
+                    return True
+            return False
+    return False
+
+
+def _checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
 
 
 # --------------------------------------------------------------- 설정 ---

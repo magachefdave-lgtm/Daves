@@ -419,3 +419,29 @@ def test_app_dir_is_per_user_unless_old_folder(tmp_path, monkeypatch):
 def test_embedded_files_exist():
     for name in ("시작하기.txt", "설비목록_예시.csv", "비밀번호_예시.csv"):
         assert os.path.isfile(core.resource_path(name)), name
+
+
+# ---------------------------------------------------------------- 상태 확인 방식 ---
+
+def test_check_method_defaults_and_csv(store, tmp_path):
+    assert core.check_method(eq(os="Linux")) == "ping"          # 리눅스 VNC 서버가 PC 를 막지 않게
+    assert core.check_method(eq()) == "port" and core.check_method(eq(os="기타")) == "port"
+    assert core.check_method(eq(os="Linux", check="port")) == "port"
+    for word, want in (("자동", "auto"), ("핑", "ping"), ("VNC 포트", "port"), ("안함", "off"), ("이상한값", "auto")):
+        assert Equipment.from_dict({"name": "a", "host": "h", "check": word}).check == want
+    store.add(eq("L1", os="Linux", check="off"))
+    store.add(eq("W1", "10.0.0.2", check="ping"))
+    out = str(tmp_path / "out.csv")
+    core.export_csv(store.load(), out)
+    other = EquipmentStore(str(tmp_path / "o.json"))
+    other.import_csv(out)
+    assert [e.check for e in other.load()] == ["off", "ping"]
+
+
+def test_ping_never_raises():
+    # 이 테스트는 Windows 빌드에서도 돈다 - 거기서는 IcmpSendEcho 를 직접 부르는 길을 시험한다
+    assert core.ping("10.0.0..1", 0.3) is False
+    assert isinstance(core.ping("127.0.0.1", 1.0), bool)
+    if sys.platform == "win32":   # 실제 네트워크에서만 (개발용 가상 환경은 아무 주소에나 가짜로 응답한다)
+        assert core.ping("127.0.0.1", 1.0) is True
+        assert core.ping("192.0.2.1", 0.5) is False              # 문서용 주소: 응답이 오지 않는다
