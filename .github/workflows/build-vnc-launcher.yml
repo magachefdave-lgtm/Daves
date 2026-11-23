@@ -50,7 +50,8 @@ jobs:
           python -c "from launcher.update import publish; publish('dist/EquipmentRemote.exe', 'updtest/server', '99.0.0', 'ci')"
           $u = (Resolve-Path updtest).Path
           Start-Process -Wait -FilePath "$u\app\EquipmentRemote.exe" -ArgumentList '--install-update',"$u\server",'--result',"$u\result.json"
-          for ($i = 0; $i -lt 90 -and -not (Test-Path "$u\result.json.relaunched")); $i++) { Start-Sleep -Seconds 1 }
+          $i = 0
+          while (-not (Test-Path "$u\result.json.relaunched") -and $i -lt 90) { Start-Sleep -Seconds 1; $i++ }
           python -c "import json; r=json.load(open('updtest/result.json')); assert r['old_exists'], r; v=open('updtest/result.json.relaunched').read(); assert v, v; print('self-update ok', r, 'relaunched', v)"
           Start-Sleep -Seconds 3
           Remove-Item -Recurse -Force updtest
