@@ -12,43 +12,32 @@ from launcher import history, local
 def test_state_roundtrip_and_bad_files(tmp_path):
     p = str(tmp_path / "ui_state.json")
     s = local.LocalState(p)                     # 파일이 없으면 기본값
-    assert (s.favorites, s.recent, s.geometry, s.zoomed, s.group) == ([], [], "", False, "")
+    assert (s.favorites, s.geometry, s.zoomed, s.group) == ([], "", False, "")
     s.set_favorite(["a", "b", "a"], True)
-    for i in "xyz":
-        s.touch(i)
-    s.touch("x")
     s.geometry, s.zoomed, s.group = "900x600+10+20", True, "식각"
     assert s.save()
     t = local.LocalState(p)
-    assert (t.favorites, t.recent, t.geometry, t.zoomed, t.group) == (
-        ["a", "b"], ["x", "z", "y"], "900x600+10+20", True, "식각")
-    for bad in ("{broken", "[1, 2]", json.dumps({"favorites": "a", "recent": [1, None, "q"],
+    assert (t.favorites, t.geometry, t.zoomed, t.group) == (["a", "b"], "900x600+10+20", True, "식각")
+    assert "recent" not in open(p, encoding="utf-8").read()        # 최근 접속은 더 남기지 않는다
+    for bad in ("{broken", "[1, 2]", json.dumps({"favorites": "a", "recent": ["x"],
                                                  "zoomed": "yes", "geometry": 5})):
         open(p, "w", encoding="utf-8").write(bad)
         u = local.LocalState(p)
-        assert u.favorites == [] and u.recent in ([], ["q"]) and u.zoomed is False and u.geometry == ""
+        assert u.favorites == [] and u.zoomed is False and u.geometry == ""
 
 
-def test_favorites_recent_forget(tmp_path):
+def test_favorites_and_forget(tmp_path):
     s = local.LocalState(str(tmp_path / "s.json"))
     assert s.set_favorite(["a", "b"], True) == 2 and s.set_favorite(["a"], True) == 0
     assert s.set_favorite(["a", "c"], False) == 1 and s.favorites == ["b"]
-    for i in range(local.RECENT_MAX + 5):
-        s.touch(f"e{i}")
-    assert len(s.recent) == local.RECENT_MAX and s.recent[0] == f"e{local.RECENT_MAX + 4}"
-    s.forget(["b", s.recent[0]])
-    assert s.favorites == [] and s.recent[0] == f"e{local.RECENT_MAX + 3}"
+    s.forget(["b"])
+    assert s.favorites == []
 
 
-def test_quick_ids_layout():
-    existing = {"a", "b", "c", "d", "e", "f"}
-    q = local.quick_ids
-    assert q([], [], existing, 4) == ([], 0)
-    assert q(["a"], ["b", "a", "c", "gone"], existing, 4) == (["a", "b", "c"], 1)   # 최근이 남은 칸을 채움
-    assert q([], ["b", "c", "d", "e", "f"], existing, 3) == (["b", "c", "d"], 0)    # 최근만: 한 줄
-    assert q(["a", "b", "c", "d"], ["e"], existing, 3) == (["a", "b", "c", "d", "e"], 4)  # 즐겨찾기는 모두
-    assert q(["a", "b", "c"], ["e"], existing, 3) == (["a", "b", "c"], 3)           # 줄이 꽉 차면 최근 없음
-    assert q(["gone"], [], existing, 3) == ([], 0)
+def test_quick_ids_is_favorites_only():
+    existing = {"a", "b", "c"}
+    assert local.quick_ids([], existing) == []
+    assert local.quick_ids(["c", "gone", "a"], existing) == ["c", "a"]    # 넣은 순서, 없는 설비는 뺌
 
 
 def test_fit_geometry():
@@ -95,10 +84,10 @@ def test_two_windows_on_one_pc_do_not_drop_favorites(tmp_path):
     w1, w2 = local.LocalState(p), local.LocalState(p)   # 같은 PC에 창 두 개
     w1.set_favorite(["eq3"], True)
     w1.save()
-    w2.touch("eq9")                                    # 오래된 목록을 들고 있던 창이 저장
+    w2.refresh_lists()                                 # 오래된 목록을 들고 있던 창이 저장 (닫을 때와 같이)
     w2.save()
     w3 = local.LocalState(p)
-    assert w3.favorites == ["eq3"] and w3.recent == ["eq9"]
+    assert w3.favorites == ["eq3"]
     w4 = local.LocalState(p)
     w1.set_favorite(["eq5"], True)                     # 두 창이 번갈아 즐겨찾기를 바꿔도
     w1.save()

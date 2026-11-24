@@ -1,4 +1,4 @@
-"""이 PC에만 남기는 것: 즐겨찾기, 최근 접속, 창 크기·위치, 마지막으로 본 그룹.
+"""이 PC에만 남기는 것: 즐겨찾기, 창 크기·위치, 마지막으로 본 그룹.
 
 설비 목록(공유될 수 있음)과 달리 사람마다 다른 것이라 설정 폴더(core.app_dir)의 ui_state.json 에 둔다.
 파일이 없거나 깨져 있으면 기본값으로 시작한다 - 이 파일 때문에 프로그램이 멈추면 안 된다.
@@ -9,14 +9,11 @@ import json
 import os
 import re
 
-RECENT_MAX = 12
-
 
 class LocalState:
     def __init__(self, path: str):
         self.path = path
         self.favorites: list[str] = []   # 설비 id, 추가한 순서
-        self.recent: list[str] = []      # 설비 id, 최근 것이 앞
         self.geometry = ""               # "폭x높이+x+y" (최대화하기 전의 크기)
         self.zoomed = False
         self.group = ""
@@ -38,19 +35,17 @@ class LocalState:
         return list(dict.fromkeys(v for v in value if isinstance(v, str) and v))
 
     def refresh_lists(self) -> None:
-        """즐겨찾기·최근 목록을 파일에서 다시 읽는다. 같은 PC에 창이 두 개 떠 있어도
+        """즐겨찾기 목록을 파일에서 다시 읽는다. 같은 PC에 창이 두 개 떠 있어도
         한쪽이 저장할 때 다른 쪽에서 바꾼 것을 지우지 않도록, 바꾸기 직전에 부른다."""
         data = self._read()
         if data is not None:
             self.favorites = self._ids(data.get("favorites"))
-            self.recent = self._ids(data.get("recent"))[:RECENT_MAX]
 
     def load(self) -> None:
         data = self._read()
         if data is None:
             return
         self.favorites = self._ids(data.get("favorites"))
-        self.recent = self._ids(data.get("recent"))[:RECENT_MAX]
         self.geometry = data.get("geometry") if isinstance(data.get("geometry"), str) else ""
         self.zoomed = data.get("zoomed") is True
         self.group = data.get("group") if isinstance(data.get("group"), str) else ""
@@ -58,7 +53,7 @@ class LocalState:
 
     def save(self) -> bool:
         tmp = self.path + ".tmp"
-        data = {"favorites": self.favorites, "recent": self.recent, "geometry": self.geometry,
+        data = {"favorites": self.favorites, "geometry": self.geometry,
                 "zoomed": self.zoomed, "group": self.group, "applied_pack": self.applied_pack}
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -84,32 +79,18 @@ class LocalState:
                 changed += 1
         return changed
 
-    def touch(self, eq_id: str) -> None:
-        """방금 접속한 설비를 최근 목록 맨 앞으로."""
-        self.refresh_lists()
-        self.recent = ([eq_id] + [r for r in self.recent if r != eq_id])[:RECENT_MAX]
-
     def forget(self, ids) -> None:
-        """삭제된 설비를 즐겨찾기·최근 목록에서 뺀다."""
+        """삭제된 설비를 즐겨찾기에서 뺀다."""
         self.refresh_lists()
         ids = set(ids)
         self.favorites = [i for i in self.favorites if i not in ids]
-        self.recent = [i for i in self.recent if i not in ids]
 
 
-def quick_ids(favorites, recent, existing, cols: int) -> tuple[list[str], int]:
-    """맨 위 "즐겨찾기 · 최근" 줄에 놓을 설비 id 와 그중 즐겨찾기 수.
+def quick_ids(favorites, existing) -> list[str]:
+    """맨 위 "즐겨찾기" 줄에 놓을 설비 id (지금 목록에 있는 것만, 넣은 순서대로).
 
-    즐겨찾기는 모두 보이고(여러 줄이 될 수 있다), 최근 접속은 마지막 줄의 남은 칸만 채운다.
-    그래서 이 줄 때문에 늘어나는 높이는 최근 접속만 있을 때 한 줄이다.
-    """
-    favs = [i for i in favorites if i in existing]
-    rest = [i for i in recent if i in existing and i not in favs]
-    if not favs and not rest:
-        return [], 0
-    cols = max(1, cols)
-    room = max(cols, -(-len(favs) // cols) * cols)
-    return (favs + rest)[:room], len(favs)
+    접속할 때마다 바뀌는 것(예전의 최근 접속)은 넣지 않는다 - 접속할 때 화면 배치가 흔들리지 않게."""
+    return [i for i in favorites if i in existing]
 
 
 _GEOM = re.compile(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$")

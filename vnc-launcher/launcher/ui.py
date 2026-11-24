@@ -576,24 +576,31 @@ class App:
         c = self.chips
         c.delete("all")
         width = max(c.winfo_width(), 200)
-        # 오른쪽 끝: 접속 시도 중(옅은 파랑) / 접속 중(파랑) 인 설비. 없으면 흐린 글자만.
+        # 오른쪽 끝: 접속 표시. 자리 폭을 접속 상태와 상관없이 고정해 둔다 - 접속할 때마다
+        # 그룹 줄이 두 줄로 넘쳤다 돌아오면 아래 설비 버튼 크기까지 흔들리기 때문이다.
+        slot = min(380, int(width * 0.4))
         trying, active = self._session_names(False), self._session_names(True)
-        right = width
-        for names, word, fill, line, ink in ((active, "접속 중", ACCENT, ACCENT, "#ffffff"),
-                                             (trying, "접속 시도 중…", TRYING_BG, TRYING_LINE, ACCENT_DARK)):
-            if not names:
-                continue
-            text = f"{word}   {self._join(names)}"
+        if active or trying:
+            if active:
+                head, names, tail = "접속 중   ", active, (f"   ·   시도 중 {len(trying)}" if trying else "")
+                fill, line, ink = ACCENT, ACCENT, "#ffffff"
+            else:
+                head, names, tail = "접속 시도 중…   ", trying, ""
+                fill, line, ink = TRYING_BG, TRYING_LINE, ACCENT_DARK
+            # 이름만 줄이고, 몇 대인지("외 N대", "시도 중 N")는 늘 보이게
+            count = f"  외 {len(names) - 1}대" if len(names) > 1 else ""
+            room_names = slot - 44 - self.f_group.measure(head + tail + count)
+            if self.f_group.measure(self._join(names)) <= room_names + self.f_group.measure(count):
+                text = head + self._join(names) + tail
+            else:
+                text = head + self._fit(names[0], self.f_group, max(room_names, 30)) + count + tail
             w = self.f_group.measure(text) + 44
-            round_rect(c, right - w, 0, right - 1, 25, 13, fill=fill, outline=line)
-            c.create_rectangle(right - w + 14, 7, right - w + 18, 19, fill=ink, outline="")
-            c.create_text(right - w + 28, 13, anchor="w", text=text, font=self.f_group, fill=ink)
-            right -= w + 6
-        if right == width:
-            idle = "접속 중인 설비 없음"
-            right -= self.f_small.measure(idle) + 8
-            c.create_text(width - 4, 13, anchor="e", text=idle, font=self.f_small, fill=SUB)
-        room = right - 16
+            round_rect(c, width - w, 0, width - 1, 25, 13, fill=fill, outline=line)
+            c.create_rectangle(width - w + 14, 7, width - w + 18, 19, fill=ink, outline="")
+            c.create_text(width - w + 28, 13, anchor="w", text=text, font=self.f_group, fill=ink)
+        else:
+            c.create_text(width - 4, 13, anchor="e", text="접속 중인 설비 없음", font=self.f_small, fill=SUB)
+        room = width - slot - 16
         x = y = 0
         chips = [(f"chip:{name}", f"{name}  {count}", name == self.group)
                  for name, count in self._groups()]
@@ -712,19 +719,18 @@ class App:
             by_group.setdefault(e.group, []).append(e)
         names = [g for g in self.store.groups if g in by_group] + ([""] if "" in by_group else [])
         self.order = [e.id for g in names for e in by_group[g]]
-        # 맨 위 "즐겨찾기 · 최근" 줄은 전체를 볼 때만 (검색·그룹·응답 없음 필터 중에는 숨긴다)
+        # 맨 위 "즐겨찾기" 줄은 전체를 볼 때만 (검색·그룹·응답 없음 필터 중에는 숨긴다)
         by_id = {e.id: e for e in self.items}
         quick_on = (self.group == ALL_GROUPS and not self.only_down
                     and not self.search_var.get().strip())
-        quick = lambda cols: (quick_ids(self.local.favorites, self.local.recent, by_id, cols)
-                              if quick_on else ([], 0))
-        has_quick = bool(quick(1)[0])
+        fav_ids = quick_ids(self.local.favorites, by_id) if quick_on else []
+        has_quick = bool(fav_ids)
         labels = has_quick or bool(names and names[0])
         # 그룹 이름은 받침판 왼쪽 칸에 둔다 - 제목 줄을 따로 쓰지 않아 세로 공간을 아낀다.
         label_w = 0
         if labels:
             titles = [g or NO_GROUP for g in names] + (["★ 즐겨찾기"] if has_quick else [])
-            subs = [f"{len(by_group[g])}대" for g in names] + (["최근 접속 포함"] if has_quick else [])
+            subs = [f"{len(by_group[g])}대" for g in names] + ([f"{len(fav_ids)}대"] if has_quick else [])
             label_w = min(140, max(max(self.f_group.measure(t) for t in titles),
                                    max(self.f_small.measure(t) for t in subs)) + 26)
         avail = width - 2 * PAD - 2 * TRAY_PAD - label_w
@@ -732,7 +738,7 @@ class App:
         top = 2
 
         def total(cols, th=TILE_H):
-            counts = [len(by_group[g]) for g in names] + ([len(quick(cols)[0])] if has_quick else [])
+            counts = [len(by_group[g]) for g in names] + ([len(fav_ids)] if has_quick else [])
             rows = [-(-n // cols) for n in counts]
             return (sum(r * (th + GAP) - GAP + 2 * TRAY_PAD for r in rows)
                     + GROUP_GAP * (len(rows) - 1) + top + 6)
@@ -751,12 +757,7 @@ class App:
 
         trays = []   # (버튼 key 앞머리, 제목, 둘째 줄, 설비)
         if has_quick:
-            ids, nfav = quick(cols)
-            if nfav:
-                title, sub = "★ 즐겨찾기", ("최근 접속 포함" if len(ids) > nfav else f"{nfav}대")
-            else:
-                title, sub = "최근 접속", ""
-            trays.append((QUICK, title, sub, [by_id[i] for i in ids]))
+            trays.append((QUICK, "★ 즐겨찾기", f"{len(fav_ids)}대", [by_id[i] for i in fav_ids]))
         trays += [("", g or NO_GROUP, f"{len(by_group[g])}대", by_group[g]) for g in names]
 
         x0 = PAD + TRAY_PAD + label_w
@@ -1374,8 +1375,6 @@ class App:
         first = not any(not s["connected"] for s in self.sessions)
         self.sessions.append({"id": eq.id, "name": eq.name, "host": eq.host, "kind": kind,
                               "proc": proc, "started": time.monotonic(), "connected": False})
-        self.local.touch(eq.id)
-        self.local.save()
         self._write_log(f"{kind} 접속", eq.name, eq.host)
         self._show_sessions()
         self.draw()
