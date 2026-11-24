@@ -119,6 +119,8 @@ def main() -> int:
     ap.add_argument("--expect", default="ok", choices=["ok", "blocked", "any"])
     ap.add_argument("--wait", type=float, default=20.0, help="서버가 뜰 때까지 기다리는 시간(초)")
     ap.add_argument("--summary")
+    ap.add_argument("--interval", type=float, default=0.0,
+                    help="확인 사이 간격(초). 0 = 몰아서 (가장 가혹한 경우), 실제 프로그램은 PC 마다 1분에 한 번")
     ap.add_argument("--require-answer", action="store_true", help="상태 확인이 모두 '응답 있음'이어야 한다")
     a = ap.parse_args()
     if a.write_passwd:
@@ -145,17 +147,22 @@ def main() -> int:
         return 2
 
     t0 = time.monotonic()
-    answered = sum(probe(method, a.host, a.port, 1.5) for _ in range(a.rounds))
+    answered = 0
+    for i in range(a.rounds):
+        if i and a.interval:
+            time.sleep(a.interval)
+        answered += probe(method, a.host, a.port, 1.5)
     took = time.monotonic() - t0
     after = vnc_login(a.host, a.port, a.password)
 
-    res = {"label": a.label, "os": a.os, "check": a.check, "method": method, "rounds": a.rounds,
+    res = {"label": a.label, "os": a.os, "check": a.check, "method": method, "rounds": a.rounds, "interval": a.interval,
            "answered": answered, "seconds": round(took, 1), "after": after[0], "detail": after[1]}
     print(json.dumps(res, ensure_ascii=False))
     good = (a.expect == "any" or after[0] == a.expect) and (answered == a.rounds or not a.require_answer)
     if a.summary:
         with open(a.summary, "a", encoding="utf-8") as f:
-            f.write(f"| {a.label} | {a.os} / {a.check} → {method} | {a.rounds} | {answered} | "
+            pace = f"{a.interval:g}초 간격" if a.interval else "몰아서"
+            f.write(f"| {a.label} | {a.os} / {a.check} → {method} | {a.rounds} ({pace}) | {answered} | "
                     f"{after[0]} | {after[1]} | {'통과' if good else '**실패**'} (기대: {a.expect}) |\n")
     return 0 if good else 1
 
