@@ -8,14 +8,15 @@
 - 사용법: [시작하기.txt](시작하기.txt)
 - 바로 실행: `실행.bat` (Python 3.10+ 필요) 또는 `python equipment_remote.py`
 - exe 만들기: Windows PC에서 `실행판_만들기.bat` → `dist/EquipmentRemote.exe` (이 파일 하나만 배포)
-- 테스트: `python -m pytest -q tests`
+- 테스트: `python -m pytest -q tests` (화면 시험 `tests/test_ui.py` 는 tkinter 와 화면이 있을 때만 돈다. 리눅스: `xvfb-run` + `twm`)
 
 | 파일 | 내용 |
 | --- | --- |
 | `launcher/core.py` | 설비 목록 저장(편집 잠금, 날짜별 백업 포함), CSV, 설정, VNC·RDP 명령 구성 |
 | `launcher/local.py` | 이 PC에만 남기는 것: 즐겨찾기, 창 크기·위치, 마지막 그룹 |
 | `launcher/pack.py` | 배포본: 설정·목록·비밀번호(배포 암호로 다시 암호화)를 exe 끝에 붙인다. `더보기 > 관리자 > 배포본 만들기` (관리자 메뉴는 배포본으로 설치한 PC 에서 숨김, Shift+더보기로 열기) |
-| `launcher/update.py` | 서버(공유) 폴더를 통한 업데이트: 올리기(`latest.json` + exe), 확인, 받아서 바꾸고 다시 켜기 |
+| `launcher/update.py` | 서버(공유) 폴더를 통한 업데이트: 올리기(`latest.json` + exe, 서명), 서명 확인, 받아서 바꾸고 다시 켜기, 관리자 서명 키 보관·백업 |
+| `launcher/sign.py` | Ed25519 서명 (RFC 8032, 표준 라이브러리만) - 업데이트가 관리자가 올린 것인지 확인 |
 | `launcher/history.py` | 접속 이력 (설비 목록 옆에 달마다 CSV) |
 | `launcher/secret.py` | VNC 비밀번호 보관 (Windows DPAPI) |
 | `launcher/wintitle.py` | Windows 창 다루기: 뷰어 창 제목, 창 앞으로 가져오기, 화면 크기 |
@@ -61,9 +62,11 @@ PIN 을 잊으면 `EquipmentRemote.exe --reset-pin`.
 |---|---|
 | 상태 확인 (Windows 설비 = VNC 포트, Linux = ping) | TigerVNC 는 로그인 없이 끊긴 연결을 "보안 실패"로 세어 PC 를 막는다 → Linux 는 ping. 같은 설비를 동시에 두 번 확인하지 않음(F5 연타), 창을 내려 두면 쉼. Linux 설비를 VNC 포트로 바꾸면 경고 |
 | 실제 서버 시험 | `.github/workflows/vnc-server-check.yml`: TigerVNC(Xvnc, x0vncserver)·x11vnc·TightVNC 를 띄우고 300번 확인한 뒤 진짜 VNC 로그인이 되는지 확인 (UltraVNC 1.8.3 은 한 번 수동 시험: 몰아서 300번이면 직후 한 번 거절, 4초 뒤 정상) (`tools/vnc_server_check.py`) |
-| 공유 설비 목록 | 파일이 잠깐 안 보이면(네트워크) 빈 목록으로 저장하지 않음. PC 마다 다른 임시 파일 이름, 바꾸기 재시도. 이 버전이 모르는 항목(새 버전이 넣은 것)도 지우지 않음. 새 형식 파일은 읽기만 |
+| 공유 설비 목록 | 파일이 잠깐 안 보이면(네트워크) 빈 목록으로 저장하지 않음. 저장 잠금 파일(`equipment.json.lock`)로 여러 PC 의 동시 저장이 서로 덮지 않음 (30초 지난 잠금은 서버 시각 기준으로 치움). PC 마다 다른 임시 파일 이름, 바꾸기 재시도. 이 버전이 모르는 항목(새 버전이 넣은 것)도 지우지 않음. 새 형식 파일은 읽기만. 쓰기 권한이 없으면 "읽기 전용"으로 돎 |
 | IP 입력 | `192.168.010.011`(Windows 는 8진수로 읽어 다른 설비에 접속), `192.168.10`, `0x..` 같은 표기를 막거나 고침 |
-| 업데이트 | 3시간마다 latest.json 확인. exe 가 공유 폴더에 있으면 그 자리에서 바꾸지 않고 설정 폴더에 받음 |
+| 업데이트 | 3시간마다 latest.json 확인. 관리자 PC 의 Ed25519 키로 서명하고, 각 PC 는 처음 본 키(또는 배포본의 키)로 서명한 것만 받음. 받기·올리기는 일꾼 스레드에서 (화면이 멈추지 않음). exe 가 공유 폴더에 있으면 그 자리에서 바꾸지 않고 설정 폴더에 받음 |
+| 편집 잠금 | 실수 방지용 (목록 파일에 쓸 수 있는 사람은 파일을 직접 고칠 수 있다). 정말 막으려면 `equipment.json` 파일 권한을 부서원 읽기 / 관리자 수정으로 |
+| 비밀번호 파일 | 저장할 때마다 `.bak`, 깨진 파일은 `.broken-날짜` 로 남기고 `.bak` 으로 읽음. 읽을 수 없을 때(백신이 잡고 있는 등) 덮어쓰지 않음 |
 | 뷰어 | TigerVNC 뷰어는 `-Shared` (기본이 단독 접속이라 같은 설비의 다른 사람을 끊음) |
 | 원격 데스크톱 | 설비 앞 화면이 잠기고 로그인한 사람이 끊길 수 있음 → 켤 때마다 처음 한 번 확인 |
 

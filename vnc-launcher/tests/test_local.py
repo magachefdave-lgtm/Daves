@@ -118,3 +118,34 @@ def test_admin_flag_roundtrip(tmp_path):
     s.admin = True
     s.save()
     assert local.LocalState(path).admin is True
+
+
+def test_update_key_roundtrip_and_validation(tmp_path):
+    path = str(tmp_path / "ui_state.json")
+    s = local.LocalState(path)
+    assert s.update_key == ""
+    s.update_key = "AB" * 32
+    assert s.save()
+    assert local.LocalState(path).update_key == "ab" * 32          # 소문자로 읽는다
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"update_key": "not-a-key"}, f)
+    assert local.LocalState(path).update_key == ""                 # 형식이 틀리면 없는 것으로 본다
+    assert not [n for n in os.listdir(tmp_path) if n.endswith(".tmp")]
+
+
+def test_update_key_is_not_wiped_by_another_window(tmp_path):
+    # 먼저 켠 창(키를 모름)이 닫히며 저장해도, 그사이 다른 창이 기억한 서명 키를 지우지 않는다
+    path = str(tmp_path / "ui_state.json")
+    old_window = local.LocalState(path)
+    new_window = local.LocalState(path)
+    new_window.update_key = "ab" * 32
+    assert new_window.save()
+    old_window.group = "1라인"
+    assert old_window.save()
+    assert local.LocalState(path).update_key == "ab" * 32
+    # 이 창이 직접 바꾼 것(--forget-update-key 등)은 그대로 저장된다
+    forget = local.LocalState(path)
+    forget.update_key = ""
+    assert forget.save()
+    old_window.save()
+    assert local.LocalState(path).update_key == ""

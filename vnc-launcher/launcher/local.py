@@ -19,6 +19,8 @@ class LocalState:
         self.group = ""
         self.applied_pack = ""           # 이미 가져온 배포본 id (같은 배포본을 다시 묻지 않게)
         self.admin: bool | None = None   # 관리자 메뉴를 늘 보일지 (None = 배포본으로 설치했는지로 정함)
+        self.update_key = ""             # 이 PC가 믿는 업데이트 서명 키 (공개 키 16진수, "" = 아직 없음)
+        self._loaded_key = ""            # 읽어 왔을 때의 update_key (이 창이 바꾸지 않았으면 저장할 때 파일 것을 지킨다)
         self.load()
 
     def _read(self) -> dict | None:
@@ -52,16 +54,24 @@ class LocalState:
         self.group = data.get("group") if isinstance(data.get("group"), str) else ""
         self.applied_pack = data.get("applied_pack") if isinstance(data.get("applied_pack"), str) else ""
         self.admin = data.get("admin") if isinstance(data.get("admin"), bool) else None
+        self.update_key = self._loaded_key = _key(data.get("update_key"))
 
     def save(self) -> bool:
-        tmp = self.path + ".tmp"
+        tmp = f"{self.path}.{os.getpid()}.tmp"   # 같은 PC에 창이 두 개 떠 있어도 서로의 임시 파일을 덮지 않게
+        if self.update_key == self._loaded_key:
+            # 이 창이 서명 키를 바꾸지 않았으면 파일에 있는 것을 그대로 둔다 - 먼저 켠 다른 창이나
+            # --forget-update-key 가 바꾼 것을 되돌리지 않게
+            current = self._read()
+            if current is not None:
+                self.update_key = self._loaded_key = _key(current.get("update_key"))
         data = {"favorites": self.favorites, "geometry": self.geometry,
                 "zoomed": self.zoomed, "group": self.group, "applied_pack": self.applied_pack,
-                "admin": self.admin}
+                "admin": self.admin, "update_key": self.update_key}
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
             os.replace(tmp, self.path)
+            self._loaded_key = self.update_key
             return True
         except OSError:
             return False
@@ -87,6 +97,10 @@ class LocalState:
         self.refresh_lists()
         ids = set(ids)
         self.favorites = [i for i in self.favorites if i not in ids]
+
+
+def _key(value) -> str:
+    return value.lower() if isinstance(value, str) and re.fullmatch(r"[0-9A-Fa-f]{64}", value) else ""
 
 
 def quick_ids(favorites, existing) -> list[str]:

@@ -1,13 +1,17 @@
 """VNC 비밀번호 보관 - Windows DPAPI로 암호화해 이 PC, 이 사용자 계정에서만 풀린다.
 
 설비 목록 파일(공유될 수 있음)에는 비밀번호를 넣지 않고, 설정 폴더(core.app_dir)의
-passwords.json 에 따로 둔다.
+passwords.json 에 따로 둔다. 저장할 때마다 직전 파일을 passwords.json.bak 으로 남기고,
+파일이 깨져 있으면 .bak 을 읽는다. 읽을 수 없을 때(백신이 잡고 있는 등)는 저장하지 않는다 -
+빈 목록으로 여기고 덮어쓰면 그 PC 의 비밀번호가 모두 사라진다.
 """
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import os
+import shutil
 import sys
 
 AVAILABLE = sys.platform == "win32"
@@ -33,25 +37,57 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
         ctypes.windll.kernel32.LocalFree(dst.pbData)
 
 
+def _read(path: str) -> dict:
+    """FileNotFoundError / OSError(읽을 수 없음) / ValueError(깨짐)를 그대로 낸다."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("passwords.json 형식이 다릅니다")
+    return data
+
+
 class PasswordStore:
     def __init__(self, path: str, encrypt=None, decrypt=None):
         self.path = path
         self._enc = encrypt or (lambda b: _dpapi(b, True))
         self._dec = decrypt or (lambda b: _dpapi(b, False))
 
-    def _load(self) -> dict:
+    def _load(self, strict: bool = False) -> dict:
+        """strict = 저장하기 전에 읽을 때: 파일을 읽을 수 없으면 OSError (덮어쓰지 않게)."""
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+            return _read(self.path)
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            try:
+                return _read(self.path + ".bak")
+            except (OSError, ValueError):
+                return {}
+        except OSError:
+            if strict:
+                raise
             return {}
 
     def _save(self, data: dict) -> None:
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, self.path)
+        try:
+            _read(self.path)
+        except FileNotFoundError:
+            pass
+        except ValueError:       # 깨진 파일은 덮기 전에 따로 남긴다
+            shutil.copyfile(self.path, f"{self.path}.broken-{datetime.datetime.now():%Y%m%d-%H%M%S}")
+        else:
+            shutil.copyfile(self.path, self.path + ".bak")
+        tmp = f"{self.path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
     def get(self, eq_id: str) -> str:
         blob = self._load().get(eq_id)
@@ -66,7 +102,7 @@ class PasswordStore:
         return bool(self._load().get(eq_id))
 
     def set(self, eq_id: str, password: str) -> None:
-        data = self._load()
+        data = self._load(strict=True)
         if password:
             data[eq_id] = base64.b64encode(self._enc(password.encode("utf-8"))).decode("ascii")
         elif eq_id in data:
@@ -76,13 +112,14 @@ class PasswordStore:
         self._save(data)
 
     def set_many(self, passwords: dict) -> None:
-        data = self._load()
+        data = self._load(strict=True)
         for eq_id, password in passwords.items():
             data[eq_id] = base64.b64encode(self._enc(password.encode("utf-8"))).decode("ascii")
         self._save(data)
 
     def delete(self, ids) -> None:
-        data = self._load()
-        kept = {k: v for k, v in data.items() if k not in set(ids)}
+        data = self._load(strict=True)
+        ids = set(ids)
+        kept = {k: v for k, v in data.items() if k not in ids}
         if len(kept) != len(data):
             self._save(kept)

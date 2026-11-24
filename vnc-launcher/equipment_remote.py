@@ -54,6 +54,28 @@ def reset_pin() -> None:
     _tell(f"편집 잠금을 껐습니다. 프로그램을 다시 실행해 [더보기 > 편집 잠금 설정]에서 새 PIN을 정하세요.\n{store.path}")
 
 
+def forget_update_key() -> None:
+    """EquipmentRemote.exe --forget-update-key : 이 PC가 기억한 업데이트 서명 키를 잊는다.
+
+    관리자가 서명 키를 바꿨는데 새 배포본을 받을 수 없을 때 쓴다. 다음 업데이트 확인 때
+    서버에 올라온 서명 키를 다시 기억한다 (그때 올라와 있는 것을 믿게 되므로 관리자와 확인한 뒤 쓴다).
+    """
+    from launcher import core
+    from launcher.local import LocalState
+    from launcher.sign import fingerprint
+    state = LocalState(os.path.join(core.app_dir(), "ui_state.json"))
+    if not state.update_key:
+        _tell("이 PC는 아직 업데이트 서명 키를 기억하고 있지 않습니다.")
+        return
+    old = state.update_key
+    state.update_key = ""
+    if not state.save():
+        _tell(f"설정 폴더에 저장하지 못했습니다.\n{state.path}")
+        return
+    _tell(f"업데이트 서명 키({fingerprint(old)})를 잊었습니다.\n"
+          "다음 업데이트 확인 때 서버에 올라온 서명 키를 새로 기억합니다.")
+
+
 if __name__ == "__main__":
     try:
         if "--pack-info" in sys.argv[1:]:   # 빌드 검사용: 배포본 내용(비밀번호 제외)을 파일로 남긴다
@@ -61,7 +83,7 @@ if __name__ == "__main__":
             from launcher.pack import own_exe, read_pack
             out = sys.argv[sys.argv.index("--pack-info") + 1]
             pack = read_pack(own_exe())
-            info = None if pack is None else {k: pack.get(k) for k in ("id", "made", "password_count")}
+            info = None if pack is None else {k: pack.get(k) for k in ("id", "made", "password_count", "update_key")}
             if pack and pack.get("equipment"):
                 info["items"] = len(pack["equipment"].get("items", []))
             with open(out, "w", encoding="utf-8") as f:
@@ -85,6 +107,9 @@ if __name__ == "__main__":
             sys.exit(0)
         if "--reset-pin" in sys.argv[1:]:
             reset_pin()
+            sys.exit(0)
+        if "--forget-update-key" in sys.argv[1:]:
+            forget_update_key()
             sys.exit(0)
         from launcher.ui import main
         main()

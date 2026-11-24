@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import tkinter as tk
+import traceback
 import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -25,8 +26,10 @@ from .core import (BACKUP_KEEP, CAUTION_MAX, CAUTION_PRESETS, OS_CHOICES, OS_WIN
 from .history import ConnectionLog
 from .local import LocalState, fit_geometry, quick_ids
 from .pack import PackError, make_payload, own_exe, read_pack, unseal, write_pack
-from .site_defaults import SHARED_EQUIPMENT_FILE, UPDATE_FOLDER
-from .update import UpdateError, cleanup_old, install, is_newer, publish, read_latest, relaunch
+from .sign import fingerprint
+from .site_defaults import SHARED_EQUIPMENT_FILE, UPDATE_FOLDER, UPDATE_PUBLIC_KEY
+from .update import (KEY_FILE, SigningKeyStore, UpdateError, cleanup_old, install, is_newer, publish,
+                     read_latest, relaunch, verify_info)
 
 GUIDE = "시작하기.txt"                                   # exe 안에 넣어 두는 사용법
 TEMPLATES = ("설비목록_예시.csv", "비밀번호_예시.csv")    # exe 안에 넣어 두는 CSV 양식
@@ -108,6 +111,7 @@ ICON_STEP = 26          # 버튼 안 아이콘(공유폴더·원격 데스크톱
 
 HANGUL_PIN = "PIN에 한글이 들어갔습니다. 한/영 키를 눌러 영문 상태에서 다시 입력하세요."
 HANGUL_PHRASE = "배포 암호에 한글이 들어갔습니다. 한/영 키를 눌러 영문 상태에서 다시 입력하세요."
+HANGUL_KEY_PHRASE = "암호에 한글이 들어갔습니다. 한/영 키를 눌러 영문 상태에서 다시 입력하세요."
 
 
 def wrong_pin_text(pin: str) -> str:
@@ -238,6 +242,9 @@ class App:
         self.anchor: str | None = None     # Shift+클릭 범위의 시작
         self.pool = ThreadPoolExecutor(max_workers=16)
         self.log_pool = ThreadPoolExecutor(max_workers=1)  # 접속 이력은 순서대로, 화면을 막지 않게
+        # 업데이트 확인·받기·올리기처럼 공유 폴더를 오래 붙잡는 일 (상태 확인 일꾼과 따로 둔다)
+        self.bg_pool = ThreadPoolExecutor(max_workers=2)
+        self.jobs: queue.Queue = queue.Queue()   # 일꾼 스레드가 끝낸 일: (화면 스레드에서 부를 함수, 결과, 오류)
         self.results: queue.Queue = queue.Queue()
         self.pending = 0
         self.inflight: set[str] = set()   # 지금 확인 중인 설비 id
@@ -285,8 +292,11 @@ class App:
         self._open_store()
         pack_ok = self._maybe_apply_pack(first_run)   # 배포본이면 넣어 둔 설정을 가져온다
         cleanup_old(own_exe())                         # 지난 업데이트에서 남은 예전 exe
-        self.update_info: dict | None = None           # 서버에 있는 새 버전 정보
-        self._update_result = None                     # 일꾼 스레드가 남긴 확인 결과
+        self.update_info: dict | None = None           # 서버에 있는 새 버전 정보 (서명 확인을 거친 것)
+        self.updating = False                          # 새 버전을 받는 중 / 올리는 중
+        self.update_checking = False                   # latest.json 을 읽는 중 (한 번에 하나만)
+        self.update_manual = False                     # 그 확인을 사용자가 직접 눌렀는지
+        self.update_rejected = ""                      # 서명이 맞지 않아 받지 않은 버전 (같은 경고를 되풀이하지 않게)
         self.check_update(manual=False)
         self.group = self.local.group or ALL_GROUPS
         self._restore_window()
@@ -484,6 +494,7 @@ class App:
             m.add_command(label="관리자", state="disabled")
             m.add_command(label="배포본 만들기…", command=self.make_pack)
             m.add_command(label="업데이트 올리기…", command=self.publish_update)
+            m.add_command(label="업데이트 서명 키…", command=self.open_signing_key)
             m.add_command(label="편집 잠금 설정…", command=self.open_lock)
             m.add_command(label="관리자 메뉴 숨기기 (부서원 PC처럼)" if admin else
                           "이 PC에서 관리자 메뉴 늘 보이기", command=lambda: self.set_admin(not admin))
@@ -566,7 +577,13 @@ class App:
     def close(self):
         self._save_window_state()
         self.pool.shutdown(wait=False, cancel_futures=True)
+        self.bg_pool.shutdown(wait=False, cancel_futures=True)
         self.log_pool.shutdown(wait=True)   # 남은 접속 이력은 마저 쓴다
+        for job in self.root.tk.splitlist(self.root.tk.call("after", "info")):   # 예약해 둔 주기 작업을 거둔다
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
         self.root.destroy()
 
     # ------------------------------------------------------ 그룹 칩 ---
@@ -693,7 +710,9 @@ class App:
         parts = [f"전체 {len(self.items)}대"]
         if self.checked_at:
             parts.append(f"{self.checked_at} 확인")
-        if self.store.lock and self.unlocked_at:
+        if self.store.read_only:
+            parts.append("읽기 전용")
+        elif self.store.lock and self.unlocked_at:
             parts.append("편집 잠금 풀림")
         self.summary["text"] = "   ·   ".join(parts)
 
@@ -1315,8 +1334,27 @@ class App:
 
     # -------------------------------------------------------- 편집 잠금 ---
 
-    def _can_edit(self) -> bool:
-        """설비 목록을 바꿔도 되는지. 잠겨 있으면 PIN 을 묻는다."""
+    def _writable(self) -> bool:
+        """이 계정이 설비 목록 파일을 바꿀 수 있는지. 못 바꾸면 알리고 False.
+
+        관리자만 쓸 수 있게 폴더 권한을 정해 둔 공유 목록이면, 부서원 PC 는 읽기 전용으로 돈다."""
+        if not self.store.read_only:
+            return True
+        writable = self.store.check_writable()   # 그사이 권한이 바뀌었을 수 있다
+        self._summary()
+        if writable:
+            return True
+        messagebox.showinfo(APP_NAME, (
+            "이 계정에는 설비 목록 파일을 바꿀 권한이 없습니다 (읽기 전용).\n"
+            f"{self.store.path}\n\n"
+            "접속, 즐겨찾기, 비밀번호 저장은 그대로 쓸 수 있습니다. 목록을 바꾸려면 관리자에게 요청하세요."))
+        return False
+
+    def _can_edit(self, write: bool = True) -> bool:
+        """설비 목록을 바꿔도 되는지. 잠겨 있으면 PIN 을 묻는다.
+        write=False: 목록 파일은 바꾸지 않는 관리자 동작 (배포본 만들기 등) - PIN 만 확인한다."""
+        if write and not self._writable():
+            return False
         if not self.store.lock:
             return True
         if self.unlocked_at:
@@ -1342,7 +1380,7 @@ class App:
         return not self.local.applied_pack
 
     def set_admin(self, on: bool):
-        if on and not self._can_edit():
+        if on and not self._can_edit(write=False):
             return
         self.local.admin = on
         self.local.save()
@@ -1355,6 +1393,8 @@ class App:
         self.toast("편집을 다시 잠갔습니다.")
 
     def open_lock(self):
+        if not self._writable():
+            return
         has_lock = bool(self.store.lock)
         dlg = LockDialog(self.root, has_lock)
 
@@ -1576,6 +1616,8 @@ class App:
 
     def set_caution(self, ids: list[str], text: str):
         """주의 표시는 PIN 없이 바꿀 수 있다 - 현장 상황을 알리는 표시라서."""
+        if not self._writable():
+            return
         try:
             changed = self.store.set_fields(ids, caution=text)
         except StoreError as e:
@@ -1597,13 +1639,13 @@ class App:
     def set_check(self, ids: list[str], method: str):
         """상태 확인 방식을 바꾸고, 바꾼 설비는 새 방식으로 바로 다시 확인한다."""
         eqs = [e for e in (self._by_id(i) for i in ids) if e]
+        if not eqs or not self._can_edit():   # 권한·PIN 을 먼저 - 경고에 답한 뒤 PIN 에서 막히지 않게
+            return
         linux = [e.name for e in eqs if e.os == "Linux"]
         if method == "port" and linux and not messagebox.askyesno(APP_NAME, (
                 "리눅스 VNC 서버(TigerVNC 등)는 포트 확인을 '보안 실패'로 세어, 5번이 쌓이면 이 PC 의 접속을 막습니다\n"
                 f"(\"Too many security failures\").\n\n리눅스 설비: {self._join(linux)}\n\n그래도 VNC 포트로 확인할까요?"),
                 icon="warning", default="no"):
-            return
-        if not eqs or not self._can_edit():
             return
         try:
             changed = self.store.set_fields([e.id for e in eqs], check=method)
@@ -1834,7 +1876,7 @@ class App:
         if not src:
             messagebox.showinfo(APP_NAME, "배포본은 EquipmentRemote.exe 로 실행했을 때만 만들 수 있습니다.")
             return
-        if not self._can_edit():
+        if not self._can_edit(write=False):
             return
         with_pw = [e.id for e in self.items if secret.AVAILABLE and self.passwords.has(e.id)]
         dlg = PackDialog(self.root, self.cfg.equipment_file, len(self.items), len(with_pw))
@@ -1852,12 +1894,16 @@ class App:
             if include_pw:
                 passwords = {i: p for i in with_pw if (p := self.passwords.get(i))}
             try:
-                write_pack(src, dst, make_payload(dataclasses.asdict(self.cfg), equipment, passwords, passphrase))
+                write_pack(src, dst, make_payload(dataclasses.asdict(self.cfg), equipment, passwords, passphrase,
+                                                  update_key=self._signing_public() or self._trusted_key()))
             except PackError as e:
                 messagebox.showerror(APP_NAME, str(e), parent=dlg.top)
                 return False
             parts = ["공유 목록 경로" if self.cfg.equipment_file else f"설비 {len(self.items)}대",
                      "뷰어 설정"] + ([f"비밀번호 {len(passwords)}대"] if passwords else [])
+            key = self._signing_public() or self._trusted_key()
+            if key:
+                parts.append(f"업데이트 서명 키 {fingerprint(key)}")
             messagebox.showinfo(APP_NAME, (
                 f"배포본을 만들었습니다.\n{dst}\n\n들어 있는 것: {', '.join(parts)}\n\n"
                 "이 파일 하나를 나눠 주면, 받은 사람은 실행만 하면 같은 상태로 시작합니다."
@@ -1869,47 +1915,118 @@ class App:
 
     # ---------------------------------------------------------- 업데이트 ---
 
+    def _bg(self, work, done):
+        """work() 를 일꾼 스레드에서 돌리고, 끝나면 화면 스레드에서 done(결과, 오류) 를 부른다."""
+        def run():
+            try:
+                self.jobs.put((done, work(), None))
+            except Exception as e:   # UpdateError 등 - 화면 쪽에서 사용자에게 보인다
+                self.jobs.put((done, None, e))
+        self.bg_pool.submit(run)
+
+    def _trusted_key(self) -> str:
+        """이 PC가 믿는 업데이트 서명 키. 빌드 때 넣은 키가 있으면 그것, 없으면 이 PC가 기억한 키."""
+        return (UPDATE_PUBLIC_KEY or self.local.update_key or "").strip().lower()
+
+    def _key_store(self) -> SigningKeyStore:
+        return SigningKeyStore(os.path.join(app_dir(), KEY_FILE))
+
+    def _signing_public(self) -> str:
+        """이 PC에 있는 업데이트 서명 키(관리자 PC)의 공개 키. 없으면 ""."""
+        try:
+            return self._key_store().public_hex()
+        except Exception:
+            return ""
+
+    def _pin_key(self, key: str):
+        key = (key or "").strip().lower()
+        if len(key) != 64 or any(ch not in "0123456789abcdef" for ch in key):
+            return
+        if not UPDATE_PUBLIC_KEY and self.local.update_key != key:
+            self.local.update_key = key
+            self.local.save()
+
     def check_update(self, manual: bool):
-        """업데이트 폴더의 latest.json 을 일꾼 스레드에서 읽는다 (공유 폴더가 느려도 화면이 멈추지 않게)."""
+        """업데이트 폴더의 latest.json 을 일꾼 스레드에서 읽고 서명을 확인한다 (공유 폴더가 느려도 화면이 멈추지 않게)."""
         folder = self.cfg.update_folder
         if not folder:
             if manual:
                 messagebox.showinfo(APP_NAME, "업데이트 폴더가 정해지지 않았습니다.\n"
                                               "[더보기 > 설정]에서 '업데이트 폴더'를 지정하세요.")
             return
-
+        if self.updating:
+            if manual:
+                self.toast("업데이트를 받는 중입니다. 잠시 기다려 주세요.")
+            return
+        if self.update_checking:       # 확인이 이미 돌고 있다 - 그 결과를 쓴다 (직접 누른 것이면 결과를 보인다)
+            self.update_manual = self.update_manual or manual
+            return
+        self.update_checking, self.update_manual = True, manual
         self.last_update_check = time.monotonic()
+        trusted = self._trusted_key()
 
         def work():
-            try:
-                self._update_result = (read_latest(folder), None, manual)
-            except UpdateError as e:
-                self._update_result = (None, str(e), manual)
+            info = read_latest(folder)
+            return (info, verify_info(info, trusted) if info else ("unsigned", ""))
 
-        self.pool.submit(work)
+        def done(result, error):
+            self.update_checking = False
+            self._update_checked(result, error, self.update_manual)
 
-    def _update_checked(self, info: dict | None, error: str | None, manual: bool):
+        self._bg(work, done)
+
+    def _update_checked(self, result, error, manual: bool):
+        if self.updating:              # 그사이 받기·올리기를 시작했다 - 버튼을 건드리지 않는다
+            return
+        if error is not None and not isinstance(error, UpdateError):
+            error = UpdateError(f"업데이트 정보를 확인하지 못했습니다.\n({error})")
+        info, (verdict, key) = result if result else (None, ("unsigned", ""))
+        if info and verdict == "trust_new":
+            self._pin_key(key)   # 처음 본 서명 키를 기억한다 - 앞으로는 이 키로 서명한 것만 받는다
+        # 1.4.7 부터 관리자는 늘 서명해 올리므로 서명 없는 것은 받지 않는다 (믿는 키를 잃은 PC 라도)
+        trusted_ok = verdict in ("ok", "trust_new")
         newer = bool(info) and is_newer(info["version"], APP_VERSION)
-        self.update_info = info if newer else None
-        if newer:
+        self.update_info = info if newer and trusted_ok else None
+        if self.update_info:
             self.update_btn.set_text(f"업데이트  v{info['version']}")
+            self.update_btn.set_enabled(True)
             if not self.update_btn.winfo_manager():
                 self.update_btn.pack(side="right", padx=(0, 6))
-            self.toast(f"새 버전 v{info['version']}이 있습니다. 위쪽의 [업데이트]를 누르세요.")
-        else:
+            if not manual:
+                self.toast(f"새 버전 v{info['version']}이 있습니다. 위쪽의 [업데이트]를 누르세요.")
+        elif not self.updating:
             self.update_btn.pack_forget()
-        if manual:
-            if error:
-                messagebox.showwarning(APP_NAME, error)
-            elif newer:
-                self.start_update()
-            else:
-                messagebox.showinfo(APP_NAME, f"최신 버전입니다. (지금 v{APP_VERSION}"
-                                    + (f", 서버 v{info['version']})" if info else ", 서버에 올린 버전 없음)"))
+        rejected = bool(info) and not trusted_ok and newer
+        if rejected and not manual and self.update_rejected != info["version"]:
+            self.update_rejected = info["version"]
+            self.toast(f"서버의 v{info['version']}은 서명이 맞지 않아 받지 않았습니다. 관리자에게 알려 주세요.")
+        if not manual:
+            return
+        if error is not None:
+            messagebox.showwarning(APP_NAME, str(error))
+        elif rejected:
+            messagebox.showwarning(APP_NAME, self._rejected_text(info, key))
+        elif self.update_info:
+            self.start_update()
+        else:
+            messagebox.showinfo(APP_NAME, f"최신 버전입니다. (지금 v{APP_VERSION}"
+                                + (f", 서버 v{info['version']})" if info else ", 서버에 올린 버전 없음)"))
+
+    def _rejected_text(self, info: dict, key: str) -> str:
+        trusted = self._trusted_key()
+        if not info.get("signature"):
+            why = "서명이 없습니다."
+        elif key and trusted and key.lower() != trusted:
+            why = f"서명 키가 다릅니다.\n  이 PC가 믿는 키: {fingerprint(trusted)}\n  서버 파일의 키: {fingerprint(key)}"
+        else:
+            why = "서명이 내용과 맞지 않습니다 (올린 뒤 파일이 바뀌었습니다)."
+        return (f"서버에 올라온 v{info.get('version', '?')}을(를) 받지 않았습니다.\n{why}\n\n"
+                "관리자가 올린 것이 아니거나, 올린 뒤 파일이 바뀌었을 수 있습니다. 관리자에게 알려 주세요.\n"
+                "(관리자가 서명 키를 바꾼 경우에는 새 배포본을 받아 한 번 실행하면 됩니다)")
 
     def start_update(self):
         info = self.update_info
-        if not info:
+        if not info or self.updating:
             return
         exe = own_exe()
         if not exe:
@@ -1921,13 +2038,18 @@ class App:
                 "프로그램이 잠깐 꺼졌다가 새 버전으로 다시 켜집니다. 설정·즐겨찾기·비밀번호는 그대로입니다."
                 + ("\n\n열려 있는 VNC 창은 그대로 둡니다." if self.sessions else ""))):
             return
-        self.root.configure(cursor="watch")
-        self.root.update_idletasks()
-        try:
-            target = install(self.cfg.update_folder, info, exe, app_dir())
-        except UpdateError as e:
-            self.root.configure(cursor="")
-            messagebox.showerror(APP_NAME, str(e))
+        self.updating = True
+        self.update_btn.set_enabled(False, "받는 중…")
+        self.toast(f"v{info['version']}을(를) 받는 중입니다…")
+        folder = self.cfg.update_folder
+        self._bg(lambda: install(folder, info, exe, app_dir()),
+                 lambda target, error: self._update_installed(info, exe, target, error))
+
+    def _update_installed(self, info: dict, exe: str, target, error):
+        if error is not None:
+            self.updating = False
+            self.update_btn.set_enabled(True, f"업데이트  v{info['version']}")
+            messagebox.showerror(APP_NAME, str(error))
             return
         if os.path.abspath(target) != os.path.abspath(exe):
             messagebox.showinfo(APP_NAME, (
@@ -1936,13 +2058,14 @@ class App:
         try:
             relaunch(target)
         except OSError as e:
-            self.root.configure(cursor="")
+            self.updating = False
+            self.update_btn.pack_forget()   # 새 exe 는 이미 놓였다 - 다시 받을 것은 없다
             messagebox.showerror(APP_NAME, f"새 버전을 켜지 못했습니다. 직접 실행하세요.\n{target}\n({e})")
             return
         self.close()
 
     def publish_update(self):
-        """지금 실행 중인 exe 를 새 버전으로 업데이트 폴더에 올린다 (관리자)."""
+        """지금 실행 중인 exe 를 새 버전으로 업데이트 폴더에 올린다 (관리자). 이 PC의 서명 키로 서명한다."""
         exe = own_exe()
         if not exe:
             messagebox.showinfo(APP_NAME, "업데이트 올리기는 EquipmentRemote.exe 로 실행했을 때만 됩니다.")
@@ -1951,7 +2074,9 @@ class App:
         if not folder:
             messagebox.showinfo(APP_NAME, "먼저 [더보기 > 설정]에서 '업데이트 폴더'를 지정하세요.")
             return
-        if not self._can_edit():
+        if self.updating:
+            return
+        if not self._can_edit(write=False):
             return
         try:
             current = read_latest(folder)
@@ -1959,6 +2084,9 @@ class App:
             if not messagebox.askyesno(APP_NAME, f"{e}\n\n그래도 이 폴더에 올릴까요?", default="no"):
                 return
             current = None
+        seed = self._seed_for_publish(current)
+        if seed is None:
+            return
         if current and not is_newer(APP_VERSION, current["version"]) and not messagebox.askyesno(
                 APP_NAME, f"서버에는 이미 v{current['version']}이 있습니다. 지금 것은 v{APP_VERSION} 입니다.\n\n"
                           "그래도 올릴까요? (받는 PC들은 서버 것이 지금 것보다 새것일 때만 업데이트합니다)",
@@ -1969,17 +2097,157 @@ class App:
                                        parent=self.root)
         if notes is None:
             return
+        self.updating = True
         self.root.configure(cursor="watch")
-        self.root.update_idletasks()
+        self.toast(f"v{APP_VERSION}을(를) 올리는 중입니다…")
+        self._bg(lambda: publish(exe, folder, APP_VERSION, notes, signing_seed=seed),
+                 lambda info, error: self._published(folder, info, error))
+
+    def _published(self, folder: str, info, error):
+        self.updating = False
+        self.root.configure(cursor="")
+        if error is not None:
+            messagebox.showerror(APP_NAME, str(error))
+            return
+        self._pin_key(info.get("key", ""))   # 관리자 PC도 자기 키로 서명한 것만 받는다
+        messagebox.showinfo(APP_NAME, f"v{info['version']}을(를) 올렸습니다.\n{folder}\n"
+                                      f"서명 키: {fingerprint(info.get('key', ''))}\n\n"
+                                      "각 PC는 프로그램을 켤 때(또는 [더보기 > 업데이트 확인]) 업데이트 버튼이 보입니다.")
+
+    def _seed_for_publish(self, current: dict | None) -> bytes | None:
+        """올릴 때 쓸 서명 키. 없으면 만든다. 서버의 것과 다른 키로 올리려 하면 먼저 묻는다. None = 그만둔다."""
+        store = self._key_store()
+        server_key = str((current or {}).get("key") or "").lower()
+        if store.exists():
+            try:
+                seed = store.load()
+            except UpdateError as e:
+                messagebox.showerror(APP_NAME, str(e))
+                return None
+            mine = store.public_hex()
+            if server_key and server_key != mine and not messagebox.askyesno(APP_NAME, (
+                    "서버의 업데이트는 이 PC와 다른 서명 키로 올라와 있습니다.\n"
+                    f"  서버: {fingerprint(server_key)}\n  이 PC: {fingerprint(mine)}\n\n"
+                    "이 PC의 키로 올리면, 서버 키를 믿는 PC들은 이 업데이트를 받지 않습니다 "
+                    "(새 배포본을 다시 나눠 줘야 합니다).\n\n그래도 이 PC의 키로 올릴까요?"),
+                    icon="warning", default="no"):
+                return None
+            return seed
+        if server_key:
+            if not messagebox.askyesno(APP_NAME, (
+                    f"서버의 업데이트는 서명 키 {fingerprint(server_key)} 로 올라와 있는데, 이 PC에는 서명 키가 없습니다.\n\n"
+                    "원래 키를 가진 관리자 PC에서 올리거나, [관리자 > 업데이트 서명 키 > 백업에서 가져오기]로 "
+                    "그 키를 이 PC에 가져온 뒤 올리세요.\n\n"
+                    "새 키를 만들어 올리면 다른 PC들은 이 업데이트를 받지 않습니다 (새 배포본을 다시 나눠 줘야 합니다).\n"
+                    "새 키를 만들어 올릴까요?"), icon="warning", default="no"):
+                return None
+        else:
+            messagebox.showinfo(APP_NAME, (
+                "업데이트 서명 키를 만듭니다.\n\n"
+                "앞으로 각 PC는 이 키로 서명한 업데이트만 받습니다. 업데이트 폴더에 누가 다른 exe 를 놓아도 받지 않습니다.\n"
+                "키는 이 PC, 이 Windows 계정에만 암호화해 둡니다. PC를 바꾸거나 잃을 때를 위해 "
+                "바로 다음에 백업 파일을 만들어 두세요."))
         try:
-            info = publish(exe, folder, APP_VERSION, notes)
+            seed = store.create()
         except UpdateError as e:
             messagebox.showerror(APP_NAME, str(e))
+            return None
+        self._pin_key(store.public_hex())
+        if messagebox.askyesno(APP_NAME, (
+                f"서명 키를 만들었습니다: {fingerprint(store.public_hex())}\n\n"
+                "지금 백업 파일을 만들까요? (USB 등 이 PC 밖에 보관하세요)")):
+            self.export_signing_key(self.root)
+        return seed
+
+    def open_signing_key(self):
+        """업데이트 서명 키: 지금 상태 보기, 백업 파일 만들기, 백업에서 가져오기 (관리자)."""
+        if not self._can_edit(write=False):
             return
-        finally:
-            self.root.configure(cursor="")
-        messagebox.showinfo(APP_NAME, f"v{info['version']}을(를) 올렸습니다.\n{folder}\n\n"
-                                      "각 PC는 프로그램을 켤 때(또는 [더보기 > 업데이트 확인]) 업데이트 버튼이 보입니다.")
+        SigningKeyDialog(self.root, self)
+
+    def export_signing_key(self, parent) -> bool:
+        store = self._key_store()
+        if not store.exists():
+            messagebox.showinfo(APP_NAME, "이 PC에는 서명 키가 없습니다. [업데이트 올리기]를 처음 하면 만들어집니다.",
+                                parent=parent)
+            return False
+        phrase = self._ask_new_phrase(parent)
+        if phrase is None:
+            return False
+        dst = filedialog.asksaveasfilename(
+            parent=parent, title="서명 키 백업 저장", defaultextension=".json",
+            initialfile=f"업데이트서명키_백업_{fingerprint(store.public_hex())}.json",
+            filetypes=[("서명 키 백업", "*.json")])
+        if not dst:
+            return False
+        try:
+            store.export(dst, phrase)
+        except UpdateError as e:
+            messagebox.showerror(APP_NAME, str(e), parent=parent)
+            return False
+        messagebox.showinfo(APP_NAME, (
+            f"서명 키를 백업했습니다.\n{dst}\n\n"
+            "이 파일과 백업 암호가 있으면 다른 PC에서도 업데이트를 올릴 수 있습니다. "
+            "업데이트 폴더나 부서 공유 폴더가 아닌 곳(USB 등)에 두고, 암호는 따로 기억하세요."), parent=parent)
+        return True
+
+    def import_signing_key(self, parent) -> bool:
+        src = filedialog.askopenfilename(parent=parent, title="서명 키 백업 파일",
+                                         filetypes=[("서명 키 백업", "*.json"), ("모든 파일", "*.*")])
+        if not src:
+            return False
+        store = self._key_store()
+        replace = False
+        for _ in range(3):
+            phrase = simpledialog.askstring("서명 키 가져오기", "백업을 만들 때 정한 암호를 입력하세요.",
+                                            show="*", parent=parent)
+            if phrase is None:
+                return False
+            try:
+                key = store.import_file(src, phrase, replace=replace)
+            except ValueError:
+                messagebox.showwarning(APP_NAME, HANGUL_KEY_PHRASE if not phrase.isascii()
+                                       else "암호가 맞지 않습니다.", parent=parent)
+                continue
+            except UpdateError as e:
+                if replace or not store.exists():
+                    messagebox.showerror(APP_NAME, str(e), parent=parent)
+                    return False
+                if not messagebox.askyesno(APP_NAME, (
+                        f"{e}\n\n이 PC의 지금 키({fingerprint(store.public_hex())})를 버리고 "
+                        "백업의 키로 바꿀까요?"), icon="warning", default="no", parent=parent):
+                    return False
+                replace = True
+                try:
+                    key = store.import_file(src, phrase, replace=True)
+                except (UpdateError, ValueError) as e2:
+                    messagebox.showerror(APP_NAME, str(e2), parent=parent)
+                    return False
+            self._pin_key(key)
+            messagebox.showinfo(APP_NAME, f"서명 키를 가져왔습니다: {fingerprint(key)}\n"
+                                          "이제 이 PC에서 업데이트를 올릴 수 있습니다.", parent=parent)
+            return True
+        return False
+
+    def _ask_new_phrase(self, parent) -> str | None:
+        while True:
+            phrase = simpledialog.askstring("서명 키 백업", "백업 파일을 잠글 암호 (영문·숫자 8자 이상)",
+                                            show="*", parent=parent)
+            if phrase is None:
+                return None
+            if not phrase.isascii():
+                messagebox.showwarning(APP_NAME, HANGUL_KEY_PHRASE, parent=parent)
+                continue
+            if len(phrase) < 8:
+                messagebox.showwarning(APP_NAME, "암호는 8자 이상이어야 합니다.", parent=parent)
+                continue
+            again = simpledialog.askstring("서명 키 백업", "같은 암호를 한 번 더 입력하세요.", show="*", parent=parent)
+            if again is None:
+                return None
+            if again != phrase:
+                messagebox.showwarning(APP_NAME, "두 번 입력한 암호가 서로 다릅니다.", parent=parent)
+                continue
+            return phrase
 
     def _maybe_apply_pack(self, first_run: bool) -> bool:
         """이 exe 가 배포본이면 넣어 둔 내용을 가져온다. 뷰어까지 준비되면 True."""
@@ -2007,7 +2275,7 @@ class App:
         known = {f.name for f in dataclasses.fields(Config)}
         cfg = Config(**{k: v for k, v in (pack.get("config") or {}).items() if k in known})
         if not os.path.isfile(cfg.viewer_path):   # 받는 PC는 뷰어가 다른 곳에 깔렸을 수 있다
-            found = detect_viewer()
+            found = detect_viewer(prefer=cfg.viewer_type)
             if found:
                 cfg.viewer_type, cfg.viewer_path = found
         self.cfg = cfg
@@ -2036,6 +2304,11 @@ class App:
                     lines.append(f"비밀번호: {len(pw)}대 저장 (이 PC·이 계정에 암호화)")
                 except OSError as e:
                     lines.append(f"비밀번호를 저장하지 못했습니다: {e}")
+        key = str(pack.get("update_key") or "").strip().lower()
+        if len(key) == 64 and all(ch in "0123456789abcdef" for ch in key):
+            # 배포본은 관리자가 직접 나눠 준 것이라, 거기 든 서명 키를 이 PC가 믿을 키로 삼는다
+            self.local.update_key = key
+            lines.append(f"업데이트 서명 키: {fingerprint(key)}")
         ok = os.path.isfile(cfg.viewer_path)
         if not ok:
             lines.append("\nVNC 뷰어를 찾지 못했습니다. 다음 설정 화면에서 뷰어 실행 파일을 지정하세요.")
@@ -2179,10 +2452,15 @@ class App:
                 self.status[eq_id] = ok
         if changed:
             self.draw()
-        if self._update_result is not None:   # 업데이트 확인이 끝났다 (일꾼 스레드)
-            info, error, manual = self._update_result
-            self._update_result = None
-            self._update_checked(info, error, manual)
+        while True:   # 업데이트 확인·받기·올리기 같은 일꾼 스레드 일이 끝났다
+            try:
+                done, result, error = self.jobs.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                done(result, error)
+            except Exception:   # 화면 스레드의 마무리에서 난 오류가 확인 주기를 멈추지 않게
+                traceback.print_exc()
         if got and self.pending <= 0:   # 한 번의 확인이 끝났다
             self.pending = 0
             self.inflight.clear()
@@ -2447,7 +2725,8 @@ class SettingsDialog(_Dialog):
             self.ufolder.set(os.path.normpath(path))
 
     def _detect(self):
-        found = detect_viewer()
+        key = self._key()
+        found = detect_viewer(prefer=None if key == "custom" else key)
         if found:
             self.vtype.set(VIEWERS[found[0]]["label"])
             self.vpath.set(found[1])
@@ -2585,6 +2864,51 @@ class LockDialog(_Dialog):
                 return
         if self.on_save and self.on_save(self.current.get(), None if off else new):
             self.top.destroy()
+
+
+class SigningKeyDialog(_Dialog):
+    """업데이트 서명 키: 지금 상태와 백업·가져오기 (관리자)."""
+
+    def __init__(self, parent, app: "App"):
+        super().__init__(parent, "업데이트 서명 키")
+        self.app = app
+        b = self.body
+        ttk.Label(b, foreground=SUB, justify="left", text=(
+            "업데이트를 올릴 때 이 키로 서명합니다. 각 PC는 처음 받은 서명 키(또는 배포본에 든 키)를 기억하고,\n"
+            "그 키로 서명한 업데이트만 받습니다. 키를 잃으면 새 배포본을 다시 나눠 줘야 하므로 백업해 두세요.")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self._row = 1
+        self.mine = ttk.Label(b)
+        self.field("이 PC의 서명 키", self.mine)
+        self.trusted = ttk.Label(b)
+        self.field("이 PC가 믿는 키", self.trusted, "업데이트를 받을 때 확인하는 키")
+        bar = ttk.Frame(b)
+        bar.grid(row=self._row, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self._row += 1
+        self.export_btn = ttk.Button(bar, text="백업 파일 만들기…", command=lambda: self._run(app.export_signing_key))
+        self.export_btn.pack(side="left")
+        ttk.Button(bar, text="백업에서 가져오기…", command=lambda: self._run(app.import_signing_key)).pack(
+            side="left", padx=(8, 0))
+        close = ttk.Frame(b)
+        close.grid(row=self._row, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(close, text="닫기", command=self.top.destroy).pack(side="right")
+        self._refresh()
+        self.top.update_idletasks()
+        try:
+            self.top.grab_set()
+        except tk.TclError:
+            pass
+
+    def _run(self, action):
+        action(self.top)
+        self._refresh()
+
+    def _refresh(self):
+        mine = self.app._signing_public()
+        trusted = self.app._trusted_key()
+        self.mine["text"] = fingerprint(mine) if mine else "없음 (업데이트를 처음 올릴 때 만듭니다)"
+        self.trusted["text"] = fingerprint(trusted) if trusted else "아직 없음 (처음 받는 서명 업데이트의 키를 믿습니다)"
+        self.export_btn["state"] = "normal" if mine else "disabled"
 
 
 def ask_group_name(parent, title: str, initial: str, existing) -> str | None:

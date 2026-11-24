@@ -59,3 +59,13 @@ def test_store_merge(tmp_path):
     got = {e.name: e for e in store.load()}
     assert got["EQ-01"].host == "10.0.0.11" and got["eq-02"].id == "other" and "EQ-04" not in got
     assert store.groups == ["B"]
+
+
+def test_payload_carries_update_key(tmp_path):
+    exe = tmp_path / "app.exe"
+    exe.write_bytes(b"MZ" + os.urandom(2000))
+    out = tmp_path / "pack.exe"
+    payload = pack.make_payload({"viewer_type": "ultravnc"}, None, None, "", update_key="cd" * 32)
+    pack.write_pack(str(exe), str(out), payload)
+    assert pack.read_pack(str(out))["update_key"] == "cd" * 32
+    assert pack.make_payload({}, None, None, "")["update_key"] == ""   # 키 없이 만든 배포본
