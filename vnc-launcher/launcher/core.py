@@ -596,17 +596,23 @@ def read_csv(csv_path: str) -> tuple[list[tuple[int, dict]], bool]:
     return rows, "host" in keys
 
 
-def export_csv(items: list[Equipment], csv_path: str) -> None:
-    """엑셀에서 바로 열리도록 BOM 붙은 UTF-8로 쓴다."""
+def export_csv(items: list[Equipment], csv_path: str, passwords: dict[str, str] | None = None) -> None:
+    """엑셀에서 바로 열리도록 BOM 붙은 UTF-8로 쓴다.
+
+    passwords({설비 id: 비밀번호})를 주면 맨 끝에 '비밀번호' 열을 붙인다 - [CSV 가져오기]가 그대로 읽는 모양.
+    """
     try:
         with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            w.writerow(CSV_COLUMNS)
+            w.writerow(CSV_COLUMNS + (("비밀번호",) if passwords is not None else ()))
             for e in items:
-                w.writerow([e.name, e.group, e.host, e.port, e.os, e.share, e.memo,
-                            "Y" if e.share_enabled else "N", e.caution,
-                            "Y" if e.rdp_enabled else "N",
-                            {"auto": "자동", "port": "포트", "ping": "ping", "off": "안함"}[e.check]])
+                row = [e.name, e.group, e.host, e.port, e.os, e.share, e.memo,
+                       "Y" if e.share_enabled else "N", e.caution,
+                       "Y" if e.rdp_enabled else "N",
+                       {"auto": "자동", "port": "포트", "ping": "ping", "off": "안함"}[e.check]]
+                if passwords is not None:
+                    row.append(passwords.get(e.id, ""))
+                w.writerow(row)
     except OSError as e:
         raise StoreError(
             f"CSV 파일을 저장할 수 없습니다.\n{csv_path}\n\n"

@@ -462,7 +462,7 @@ class App:
         m.add_command(label="여러 대 선택하기", command=self.start_selection)
         m.add_separator()
         m.add_command(label="CSV 가져오기 (설비 · 비밀번호)", command=self.import_csv)
-        m.add_command(label="CSV 내보내기", command=self.export_csv)
+        m.add_command(label="CSV 내보내기 (설비 · 비밀번호)", command=self.export_csv)
         m.add_separator()
         m.add_command(label="접속 이력 보기", command=self.open_history)
         m.add_command(label="백업 폴더 열기", command=self.open_backups)
@@ -1791,17 +1791,40 @@ class App:
         return text
 
     def export_csv(self):
-        path = filedialog.asksaveasfilename(title="CSV 내보내기", defaultextension=".csv",
-                                            initialfile="설비목록.csv",
-                                            filetypes=[("CSV 파일", "*.csv")])
+        items = sorted(self.items, key=lambda e: (e.group, natural_key(e.name)))
+        saved = [e for e in items if secret.AVAILABLE and self.passwords.has(e.id)]
+        passwords = None
+        if saved:
+            answer = messagebox.askyesnocancel(APP_NAME, (
+                f"저장해 둔 VNC 비밀번호({len(saved)}대)도 함께 내보낼까요?\n\n"
+                "예: 마지막 열에 비밀번호를 넣습니다. 다른 PC에서 [CSV 가져오기]로 설비와 비밀번호를 "
+                "한 번에 넣을 수 있습니다. 파일에는 비밀번호가 그대로 적히므로 쓴 뒤에는 지우세요.\n"
+                "아니요: 설비 정보만 내보냅니다."), icon="question", default="no")
+            if answer is None:
+                return
+            if answer:
+                if not self._can_edit():      # 편집 잠금이 있으면 비밀번호를 꺼내기 전에 PIN 을 묻는다
+                    return
+                passwords = {e.id: pw for e in saved if (pw := self.passwords.get(e.id))}
+        path = filedialog.asksaveasfilename(
+            title="CSV 내보내기", defaultextension=".csv",
+            initialfile="설비목록_비밀번호포함.csv" if passwords is not None else "설비목록.csv",
+            filetypes=[("CSV 파일", "*.csv")])
         if not path:
             return
         try:
-            export_csv(sorted(self.items, key=lambda e: (e.group, natural_key(e.name))), path)
+            export_csv(items, path, passwords)
         except StoreError as e:
             messagebox.showerror(APP_NAME, str(e))
-        else:
+            return
+        if passwords is None:
             self.toast(f"CSV로 내보냈습니다: {path}")
+            return
+        missing = len(saved) - len(passwords)
+        messagebox.showinfo(APP_NAME, (
+            f"설비 {len(items)}대와 비밀번호 {len(passwords)}대를 내보냈습니다.\n{path}\n\n"
+            + (f"비밀번호 {missing}대는 이 PC·이 계정에서 풀 수 없어 빈칸으로 두었습니다.\n\n" if missing else "")
+            + "이 파일에는 비밀번호가 그대로 적혀 있습니다. 옮긴 뒤에는 지우세요."))
 
     def _open_path(self, path: str):
         if sys.platform != "win32":

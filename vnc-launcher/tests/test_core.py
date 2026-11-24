@@ -509,3 +509,28 @@ def test_first_run_still_creates_the_list(tmp_path):
     store.add(core.Equipment(name="A", host="10.0.0.1"))
     assert [e.name for e in store.load()] == ["A"]
     assert not [n for n in os.listdir(tmp_path / "new") if n.endswith(".tmp")]
+
+
+def test_export_with_passwords_round_trips_through_import(tmp_path):
+    src = core.EquipmentStore(str(tmp_path / "a.json"))
+    src.add(core.Equipment(name="ETCH-01", host="10.0.0.1", group="식각"))
+    src.add(core.Equipment(name="CVD-01", host="10.0.0.2", os="Linux"))
+    a, b = sorted(src.load(), key=lambda e: e.name != "ETCH-01")
+    out = str(tmp_path / "out.csv")
+    core.export_csv(src.load(), out, {a.id: "p@ss, 1\"q", b.id: ""})   # 쉼표·따옴표가 든 비밀번호, 빈 비밀번호
+    head = open(out, encoding="utf-8-sig").readline().strip().split(",")
+    assert head[-1] == "비밀번호"
+    dst = core.EquipmentStore(str(tmp_path / "b.json"))
+    added, updated, problems, passwords = dst.import_csv(out)
+    assert (added, updated, problems) == (2, 0, [])
+    by_name = {e.name: e for e in dst.load()}
+    assert passwords == {by_name["ETCH-01"].id: "p@ss, 1\"q"}
+    assert by_name["CVD-01"].os == "Linux" and by_name["ETCH-01"].group == "식각"
+
+
+def test_export_without_passwords_has_no_password_column(tmp_path):
+    store = core.EquipmentStore(str(tmp_path / "a.json"))
+    store.add(core.Equipment(name="ETCH-01", host="10.0.0.1"))
+    out = str(tmp_path / "out.csv")
+    core.export_csv(store.load(), out)
+    assert "비밀번호" not in open(out, encoding="utf-8-sig").readline()
