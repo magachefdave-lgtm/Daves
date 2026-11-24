@@ -743,6 +743,14 @@ def test_read_only_folder_without_file(tmp_path):
         pytest.skip("chmod 로 쓰기를 막을 수 없는 환경")
     os.chmod(folder, 0o555)
     try:
+        try:
+            with open(folder / "probe", "w"):
+                pass
+        except OSError:
+            pass
+        else:
+            os.remove(folder / "probe")
+            pytest.skip("폴더는 chmod 로 쓰기를 막을 수 없는 환경 (Windows)")
         assert s.load() == [] and s.read_only is True
         with pytest.raises(StoreError):
             s.add(eq("A"))

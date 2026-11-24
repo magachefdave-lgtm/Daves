@@ -38,7 +38,7 @@ jobs:
           REQUIRE_UI_TESTS: "1"
         run: |
           printf 'RandomPlacement\nNoTitle\n' > "$HOME/.twmrc"
-          xvfb-run -a -s "-screen 0 1280x800x24" sh -c 'twm >/dev/null 2>&1 & sleep 1; python -m pytest -q -rs tests'
+          xvfb-run -a -s "-screen 0 1280x800x24" sh -c 'twm >/dev/null 2>&1 & sleep 3; python -m pytest -q -rs tests'
 
   build:
     runs-on: windows-latest

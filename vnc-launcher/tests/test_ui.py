@@ -549,13 +549,19 @@ def test_auto_check_pauses_while_minimized(env):
     env.write_list([Equipment("A", "10.6.0.1")])
     app = env.start()
     app.root.iconify()
-    if not pump(app, lambda: app.root.state() == "iconic", timeout=2):
-        _skip("창 관리자가 없어 최소화가 되지 않습니다")
+    real = pump(app, lambda: app.root.state() == "iconic", timeout=5)
+    if not real:
+        # 창 관리자가 늦게 뜨거나 없어 실제로 내려가지 않았다 - 프로그램이 보는 상태만 바꿔 같은 흐름을 본다
+        env.mp.setattr(app.root, "state", lambda: "iconic")
     app.last_check = time.monotonic() - 120
     app._tick_clock()
     pump(app)
     assert env.probe.calls == []                    # 내려 둔 동안은 두드리지 않는다
-    app.root.deiconify()
+    if real:
+        app.root.deiconify()
+    else:
+        env.mp.setattr(app.root, "state", lambda: "normal")
+        app._on_map(type("E", (), {"widget": app.root})())
     assert pump(app, lambda: env.probe.calls, timeout=3)   # 다시 열면 바로 확인
     assert wait_checked(app)
 
