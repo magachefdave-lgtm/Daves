@@ -123,7 +123,14 @@ jobs:
           QueryTimeout=1
           QueryAccept=1
           "@
-          ($ini -split "`n" | ForEach-Object { $_.Trim() }) -join "`r`n" | Set-Content -Encoding ascii (Join-Path $exe.DirectoryName 'ultravnc.ini')
+          Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force
+          $iniPath = Join-Path $exe.DirectoryName 'ultravnc.ini'
+          ($ini -split "`n" | ForEach-Object { $_.Trim() }) -join "`r`n" | Set-Content -Encoding ascii $iniPath
+          # 비밀번호는 UltraVNC 의 setpasswd.exe 로 다시 넣는다 (버전마다 저장 형식이 다를 수 있다)
+          $sp = Join-Path $exe.DirectoryName 'setpasswd.exe'
+          if (Test-Path $sp) { Push-Location $exe.DirectoryName; & $sp ci-pw-01 ci-pw-01 | Write-Host; Pop-Location } else { Write-Host "setpasswd.exe 없음" }
+          Get-ChildItem $exe.DirectoryName -Name | Write-Host
+          Get-Content $iniPath | Write-Host
           Start-Process $exe.FullName -ArgumentList '-run'
           Start-Sleep -Seconds 8
           if (-not (Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue)) {
