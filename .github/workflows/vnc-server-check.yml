@@ -67,6 +67,8 @@ jobs:
 
   windows-servers:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"   # 한글 출력 (Windows 콘솔 기본은 cp1252)
     defaults:
       run:
         working-directory: vnc-launcher
