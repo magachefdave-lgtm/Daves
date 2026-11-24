@@ -76,6 +76,7 @@ RADIUS = 10             # 설비 버튼 모서리
 TRAY_PAD = 6            # 받침판 안쪽 여백
 TRAY_RADIUS = RADIUS + TRAY_PAD
 ICON_ZONES = ("share", "rdp")
+CHECK_SHORT = {"auto": "자동", "port": "VNC 포트", "ping": "ping", "off": "하지 않음"}
 RELOCK_SECONDS = 30 * 60   # 편집 잠금을 푼 뒤 이만큼 편집하지 않으면 다시 잠근다
 QUICK = "q"                # 맨 위 "즐겨찾기 · 최근" 줄의 버튼 key 앞에 붙인다
 
@@ -383,12 +384,16 @@ class App:
         self.selbar, selrow = island(root, 52, 5, 45)
         self.sel_label = tk.Label(selrow, font=self.f_group, bg=HEAD, fg=HEAD_TEXT)
         self.sel_label.pack(side="left")
-        PillButton(selrow, "끝내기  Esc", self.end_selection, self.f_body, quiet,
-                   HEAD).pack(side="right")
-        PillButton(selrow, "모두 고르기", self.select_all_visible, self.f_body, quiet,
-                   HEAD).pack(side="right", padx=6)
-        move_btn = PillButton(selrow, "그룹 이동  ▾", None, self.f_body, quiet, HEAD)
-        caution_btn = PillButton(selrow, "주의 표시  ▾", None, self.f_body, quiet, HEAD)
+        self.sel_row = selrow
+        self.sel_compact = False
+        end_btn = PillButton(selrow, "끝내기  Esc", self.end_selection, self.f_body, quiet, HEAD)
+        end_btn.pack(side="right")
+        all_btn = PillButton(selrow, "모두 고르기", self.select_all_visible, self.f_body, quiet, HEAD)
+        all_btn.pack(side="right", padx=6)
+        move_btn = PillButton(selrow, "그룹  ▾", None, self.f_body, quiet, HEAD)
+        caution_btn = PillButton(selrow, "주의  ▾", None, self.f_body, quiet, HEAD)
+        check_btn = PillButton(selrow, "상태 확인  ▾", None, self.f_body, quiet, HEAD)
+        check_btn.command = lambda: self._menu_below(check_btn, self._fill_check_menu, self.sub_check)
         move_btn.command = lambda: self._menu_below(move_btn, self._fill_move_menu, self.sub_move)
         caution_btn.command = lambda: self._menu_below(caution_btn, self._fill_caution_menu,
                                                        self.sub_caution)
@@ -396,9 +401,13 @@ class App:
             PillButton(selrow, "삭제", lambda: self.delete(sorted(self.selected)), self.f_body,
                        (ALERT, ALERT_DARK, "#ffffff"), HEAD),
             PillButton(selrow, "★ 즐겨찾기", self.favorite_selected, self.f_body, quiet, HEAD),
-            caution_btn, move_btn]
+            check_btn, caution_btn, move_btn]
         for b in self.sel_buttons:
             b.pack(side="right", padx=(0, 6))
+        # 창이 좁으면 짧은 이름으로 (버튼, 넓을 때, 좁을 때)
+        self.sel_names = [(end_btn, "끝내기  Esc", "끝내기"), (all_btn, "모두 고르기", "모두"),
+                          (self.sel_buttons[1], "★ 즐겨찾기", "★"), (check_btn, "상태 확인  ▾", "확인  ▾")]
+        selrow.bind("<Configure>", lambda _e: self._fit_selbar())
         # 설명은 맨 나중에 넣어, 창이 좁으면 버튼이 아니라 설명이 줄어들게 한다
         tk.Label(selrow, text="클릭 = 고르기·빼기    Shift+클릭 = 범위", font=self.f_small, anchor="w",
                  bg=HEAD, fg=HEAD_SUB).pack(side="left", padx=(14, 0), fill="x", expand=True)
@@ -434,6 +443,7 @@ class App:
         self.sub_move = tk.Menu(self.menu, **self.menu_opts)
         self.sub_caution = tk.Menu(self.menu, **self.menu_opts)
         self.sub_buttons = tk.Menu(self.menu, **self.menu_opts)
+        self.sub_check = tk.Menu(self.menu, **self.menu_opts)
         self.more_menu = tk.Menu(root, **self.menu_opts)
 
     def _show_more(self):
@@ -970,9 +980,12 @@ class App:
             word = STATUS_WORD.get(st, "상태 미확인")
             if mine:
                 word = "접속 중" if any(s["connected"] for s in mine) else "접속 시도 중"
-            how = {"ping": " (ping)", "off": " (확인 안 함)"}.get(check_method(eq), "")
+            method = check_method(eq)
+            how = {"ping": " (ping)", "off": " (확인 안 함)"}.get(method, "")
+            hint = ("ping 이 막힌 설비면: 오른쪽 클릭 > 상태 확인 > 하지 않음"
+                    if method == "ping" and st is False and not mine else "")
             parts = [eq.name, eq.host if eq.port == 5900 else f"{eq.host}:{eq.port}", eq.os,
-                     eq.group or NO_GROUP, word + how, f"▲ {eq.caution}" if eq.caution else "", eq.memo]
+                     eq.group or NO_GROUP, word + how, f"▲ {eq.caution}" if eq.caution else "", eq.memo, hint]
             self.foot_var.set("   ·   ".join(p for p in parts if p))
 
     def _on_motion(self, _event):
@@ -1040,6 +1053,8 @@ class App:
         if eq.os == OS_WINDOWS and (self.cfg.show_share or self.cfg.show_rdp):
             self._fill_buttons_menu(self.sub_buttons, eq)
             m.add_cascade(label="버튼 표시", menu=self.sub_buttons)
+        self._fill_check_menu(self.sub_check, [eq.id])
+        m.add_cascade(label=f"상태 확인  ({CHECK_SHORT[eq.check]})", menu=self.sub_check)
         if secret.AVAILABLE and self.cfg.supports_password():
             m.add_command(label="VNC 비밀번호 저장…", command=lambda: self.set_password(eq))
         m.add_command(label="수정…", command=lambda: self.edit(eq))
@@ -1060,6 +1075,8 @@ class App:
         m.add_cascade(label="주의 표시", menu=self.sub_caution)
         self._fill_move_menu(self.sub_move, ids)
         m.add_cascade(label="그룹 이동", menu=self.sub_move)
+        self._fill_check_menu(self.sub_check, ids)
+        m.add_cascade(label="상태 확인", menu=self.sub_check)
         m.add_separator()
         m.add_command(label=f"{len(ids)}대 삭제", command=lambda: self.delete(ids))
         m.add_command(label="선택 끝내기", command=self.end_selection)
@@ -1085,6 +1102,13 @@ class App:
             menu.add_separator()
             menu.add_command(label="    주의 표시 지우기", command=lambda: self.set_caution(ids, ""))
 
+    def _fill_check_menu(self, menu: tk.Menu, ids: list[str]):
+        menu.delete(0, "end")
+        current = {e.check for e in (self._by_id(i) for i in ids) if e}
+        for key, label in CHECK_METHODS.items():
+            menu.add_command(label=("✓ " if current == {key} else "    ") + label,
+                             command=lambda k=key: self.set_check(ids, k))
+
     def _fill_buttons_menu(self, menu: tk.Menu, eq: Equipment):
         menu.delete(0, "end")
         if self.cfg.show_share:
@@ -1098,6 +1122,9 @@ class App:
         self.only_down = not self.only_down
         self.canvas.yview_moveto(0)
         self.draw()
+        if self.only_down:
+            self.toast("응답 없는 설비만 보고 있습니다. ping 이 막힌 설비라면: Ctrl+클릭 → [모두 고르기] → "
+                       "[상태 확인 ▾] → 하지 않음")
 
     def _on_enter(self, _event):
         shown = self.visible()
@@ -1168,13 +1195,43 @@ class App:
             self.selected.add(eq_id)
         self.anchor = eq_id
 
+    def _sel_text(self) -> str:
+        n = len(self.selected)
+        if n:
+            return f"{n}대 선택"
+        return "고르세요" if self.sel_compact else "설비를 클릭해서 고르세요"
+
+    def _fit_selbar(self):
+        """선택 바가 창 폭에 다 들어가지 않으면 버튼을 짧은 이름으로 바꾼다."""
+        avail = self.sel_row.winfo_width()
+        if avail <= 1:
+            return
+        names = {id(b): (full, short) for b, full, short in self.sel_names}
+        buttons = [b for b, _f, _s in self.sel_names] + [b for b in self.sel_buttons
+                                                          if id(b) not in names]
+
+        def need(compact: bool) -> int:
+            total = self.f_group.measure(f"{len(self.selected)}대 선택" if self.selected else
+                                         ("고르세요" if compact else "설비를 클릭해서 고르세요"))
+            for b in buttons:
+                text = names[id(b)][1 if compact else 0] if id(b) in names else b.text
+                total += self.f_body.measure(text) + 30 + 6
+            return total + 24
+
+        compact = need(False) > avail
+        if compact != self.sel_compact:
+            self.sel_compact = compact
+            for b, full, short in self.sel_names:
+                b.set_text(short if compact else full)
+            self.sel_label["text"] = self._sel_text()
+
     def _sync_selbar(self):
         self.selected &= {e.id for e in self.items}
         if not self.selecting:
             self.selbar.pack_forget()
             return
         n = len(self.selected)
-        self.sel_label["text"] = f"{n}대 선택" if n else "설비를 클릭해서 고르세요"
+        self.sel_label["text"] = self._sel_text()
         for b in self.sel_buttons:
             if b.enabled != bool(n):
                 b.set_enabled(bool(n))
@@ -1474,6 +1531,32 @@ class App:
             initialvalue=current.pop() if len(current) == 1 else "", parent=self.root)
         if text is not None:
             self.set_caution(ids, text.strip())
+
+    def set_check(self, ids: list[str], method: str):
+        """상태 확인 방식을 바꾸고, 바꾼 설비는 새 방식으로 바로 다시 확인한다."""
+        eqs = [e for e in (self._by_id(i) for i in ids) if e]
+        linux = [e.name for e in eqs if e.os == "Linux"]
+        if method == "port" and linux and not messagebox.askyesno(APP_NAME, (
+                "리눅스 VNC 서버(TigerVNC 등)는 포트 확인을 '보안 실패'로 세어, 5번이 쌓이면 이 PC 의 접속을 막습니다\n"
+                f"(\"Too many security failures\").\n\n리눅스 설비: {self._join(linux)}\n\n그래도 VNC 포트로 확인할까요?"),
+                icon="warning", default="no"):
+            return
+        if not eqs or not self._can_edit():
+            return
+        try:
+            changed = self.store.set_fields([e.id for e in eqs], check=method)
+        except StoreError as e:
+            messagebox.showwarning(APP_NAME, str(e))
+            self.reload()
+            return
+        for e in eqs:
+            self.status.pop(e.id, None)   # 예전 방식의 결과는 버린다
+        self.reload()
+        if changed:
+            who = eqs[0].name if len(eqs) == 1 else f"설비 {len(eqs)}대"
+            self.toast(f"{who}의 상태 확인을 '{CHECK_SHORT[method]}'(으)로 바꿨습니다.")
+        self.check_status([e for e in self.items if e.id in {x.id for x in eqs}], quiet=True)
+        self.draw()
 
     def set_buttons(self, ids: list[str], **fields):
         if not self._can_edit():
