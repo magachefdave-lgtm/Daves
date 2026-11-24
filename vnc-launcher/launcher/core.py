@@ -662,6 +662,13 @@ def is_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
         return False
 
 
+def probe(method: str, host: str, port: int, timeout: float = 1.5) -> bool:
+    """상태 확인 한 번 (check_method 가 고른 방식으로). 프로그램과 서버 점검 도구가 같은 것을 쓴다."""
+    if method == "off":
+        return False
+    return ping(host, timeout) if method == "ping" else is_reachable(host, port, timeout)
+
+
 def ping(host: str, timeout: float = 1.5) -> bool:
     """ICMP 응답(ping)이 오는지. VNC 서버를 건드리지 않으므로 서버가 이 PC 를 막을 일이 없다."""
     try:

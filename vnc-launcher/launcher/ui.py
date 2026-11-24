@@ -20,7 +20,7 @@ from .core import (BACKUP_KEEP, CAUTION_MAX, CAUTION_PRESETS, OS_CHOICES, OS_WIN
                    VIEWERS, Config, Equipment, EquipmentStore, StoreError, app_dir, build_command,
                    resource_path,
                    check_pin, detect_viewer, equipment_file, export_csv, has_rdp, has_share,
-                   CHECK_METHODS, check_method, is_reachable, ping, load_config, natural_key, rdp_command, read_csv, save_config,
+                   CHECK_METHODS, check_method, probe, load_config, natural_key, rdp_command, read_csv, save_config,
                    share_path)
 from .history import ConnectionLog
 from .local import LocalState, fit_geometry, quick_ids
@@ -2095,7 +2095,7 @@ class App:
     def _probe(self, eq_id: str, host: str, port: int, timeout: float, method: str = "port"):
         """일꾼 스레드에서 돈다. 무슨 일이 있어도 결과를 하나 남겨야 확인이 끝난다."""
         try:
-            ok = ping(host, timeout) if method == "ping" else is_reachable(host, port, timeout)
+            ok = probe(method, host, port, timeout)
         except Exception:
             ok = False
         self.results.put((eq_id, host, port, ok))
