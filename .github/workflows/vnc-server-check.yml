@@ -86,25 +86,12 @@ jobs:
           "|---|---|---|---|---|---|---|" >> $env:GITHUB_STEP_SUMMARY
       - name: UltraVNC server
         timeout-minutes: 10
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # UltraVNC 공식 배포(GitHub ultravnc/UltraVNC 최신 릴리스)를 받는다
-          $rel = gh api repos/ultravnc/UltraVNC/releases/latest | ConvertFrom-Json
-          Write-Host "UltraVNC release: $($rel.tag_name)"; $rel.assets | ForEach-Object { Write-Host "  $($_.name)" }
+          # UltraVNC (Chocolatey 패키지 = 공식 설치 파일을 조용히 설치). 설치 기록을 그대로 남긴다.
+          choco install ultravnc -y --no-progress --ignore-checksums 2>&1 | Write-Host
           $dir = Join-Path $env:RUNNER_TEMP 'uvnc'
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          $zip = $rel.assets | Where-Object { $_.name -match '\.zip$' } | Sort-Object { -not ($_.name -match 'x64|64') } | Select-Object -First 1
-          if ($zip) {
-            Invoke-WebRequest $zip.browser_download_url -OutFile "$dir\u.zip"
-            Expand-Archive "$dir\u.zip" -DestinationPath $dir -Force
-          } else {
-            $setup = $rel.assets | Where-Object { $_.name -match '\.exe$' } | Sort-Object { -not ($_.name -match 'x64|64') } | Select-Object -First 1
-            if (-not $setup) { throw "UltraVNC 릴리스에서 설치 파일을 찾지 못함" }
-            Invoke-WebRequest $setup.browser_download_url -OutFile "$dir\setup.exe"
-            Start-Process -Wait "$dir\setup.exe" -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES',"/DIR=$dir\inst"
-          }
-          $all = Get-ChildItem $dir, 'C:\Program Files\uvnc bvba', 'C:\Program Files\UltraVNC' -Recurse -Filter winvnc.exe -ErrorAction SilentlyContinue
+          $rel = [pscustomobject]@{ tag_name = 'chocolatey' }
+          $all = Get-ChildItem 'C:\Program Files\uvnc bvba', 'C:\Program Files\UltraVNC', 'C:\Program Files (x86)\uvnc bvba', 'C:\Program Files (x86)\UltraVNC', 'C:\ProgramData\chocolatey\lib\ultravnc' -Recurse -Filter winvnc.exe -ErrorAction SilentlyContinue
           $exe = ($all | Where-Object { $_.FullName -match 'x64|64' } | Select-Object -First 1)
           if (-not $exe) { $exe = $all | Select-Object -First 1 }
           if (-not $exe) { throw "winvnc.exe 를 찾지 못함" }
