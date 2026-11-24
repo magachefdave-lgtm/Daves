@@ -106,3 +106,15 @@ def test_history_view_copies_do_not_collide(tmp_path):
     assert first != second and os.path.exists(first) and os.path.exists(second)
     for f in (first, second):
         os.remove(f)
+
+
+def test_admin_flag_roundtrip(tmp_path):
+    path = str(tmp_path / "ui_state.json")
+    s = local.LocalState(path)
+    assert s.admin is None                      # 정하지 않음 (배포본 설치 여부로 정한다)
+    s.admin = False
+    s.save()
+    assert local.LocalState(path).admin is False
+    s.admin = True
+    s.save()
+    assert local.LocalState(path).admin is True

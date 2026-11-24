@@ -37,6 +37,17 @@ CAUTION_MAX = 30
 BACKUP_KEEP = 14        # 날짜별 백업을 며칠치 남길지
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
+_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_NUMERIC_RE = re.compile(r"^(0[xX][0-9A-Fa-f]+|[\d.]+)$")   # 숫자로만 된 주소 (IP 로 읽힌다)
+
+
+def normalize_host(host: str) -> str:
+    """192.168.010.011 -> 192.168.10.11. 엑셀 등에서 자리를 맞춘 0 을 뗀다.
+    그대로 두면 Windows 가 앞에 0 이 붙은 자리를 8진수로 읽어 192.168.8.9 로 접속한다."""
+    host = host.strip()
+    if _IPV4_RE.match(host):
+        return ".".join(str(int(p)) for p in host.split("."))
+    return host
 _SHARE_BAD = re.compile(r'[<>"|?*\x00-\x1f]')
 
 
@@ -70,7 +81,7 @@ class Equipment:
     def from_dict(cls, d: dict) -> "Equipment":
         return cls(
             name=str(d.get("name", "")).strip(),
-            host=str(d.get("host", "")).strip(),
+            host=normalize_host(str(d.get("host", ""))),
             group=str(d.get("group", "")).strip(),
             port=_to_port(d.get("port", DEFAULT_PORT)),
             os=normalize_os(d.get("os", OS_WINDOWS)),
@@ -182,6 +193,10 @@ def validate(eq: Equipment) -> list[str]:
         errors.append("IP(또는 호스트명)를 입력하세요.")
     elif not _HOST_RE.match(eq.host):
         errors.append("IP(또는 호스트명)에는 영문, 숫자, 점(.), 하이픈(-)만 쓸 수 있습니다.")
+    elif _NUMERIC_RE.match(eq.host) and not (
+            _IPV4_RE.match(eq.host) and all(int(p) <= 255 and str(int(p)) == p for p in eq.host.split("."))):
+        # 192.168.10 이나 0x0a000001 같은 줄임 표기는 Windows 가 다른 주소(192.168.0.10 등)로 읽는다
+        errors.append("IP는 점 3개로 나뉜 네 자리 숫자(0~255)로 적어 주세요. 예: 192.168.10.11")
     elif any(not part or len(part) > 63 for part in eq.host.split(".")):
         errors.append("IP(또는 호스트명)에 점(.)이 연달아 있거나 너무 긴 부분이 있습니다. 예: 192.168.10.11")
     if not 1 <= eq.port <= 65535:
@@ -206,6 +221,25 @@ def share_path(eq: Equipment) -> str:
 
 # ------------------------------------------------------------ 목록 저장 ---
 
+FORMAT_VERSION = 1   # 설비 목록 파일 형식. 이보다 큰 파일은 읽기만 한다.
+
+
+def _safe_name(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", text)[:40] or "pc"
+
+
+def _replace_retry(src: str, dst: str, tries: int = 5) -> None:
+    """os.replace. 다른 PC 가 마침 그 파일을 읽는 중이면 Windows 는 바꾸기를 거절하므로 잠깐씩 다시 해 본다."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.2 * (i + 1))
+
+
 class EquipmentStore:
     """JSON 파일 하나에 설비 목록을 둔다.
 
@@ -219,6 +253,10 @@ class EquipmentStore:
         self.path = path
         self.groups: list[str] = []  # 화면에 보일 그룹 순서 (설비가 없는 빈 그룹 포함)
         self.lock: dict | None = None  # 편집 잠금 (PIN 해시). None = 잠금 없음
+        self.seen_file = False         # 한 번이라도 파일을 읽었거나 썼는지 (그 뒤에 파일이 안 보이면 = 연결 문제)
+        self.extra: dict[str, dict] = {}   # 이 버전이 모르는 항목 (새 버전이 넣은 것) - 저장할 때 그대로 둔다
+        self.extra_top: dict = {}
+        self.newer_format = False      # 이 버전보다 새 형식의 파일 (저장하지 않는다)
         self.today = lambda: datetime.date.today().isoformat()   # 테스트에서 바꿔 끼운다
 
     def folder(self) -> str:
@@ -246,14 +284,29 @@ class EquipmentStore:
 
     def load(self) -> list[Equipment]:
         if not os.path.exists(self.path):
+            if self.seen_file:
+                # 읽던 파일이 안 보이면 대개 네트워크가 잠깐 끊긴 것이다. 빈 목록으로 여기면
+                # 그다음 저장이 공유 목록 전체를 지워 버리므로, 오류로 다룬다.
+                raise StoreError(
+                    f"설비 목록 파일이 보이지 않습니다.\n{self.path}\n\n"
+                    "공유 폴더라면 네트워크 연결을 확인하세요. 목록이 지워지지 않도록 지금은 저장하지 않습니다.")
             self.groups, self.lock = [], None
             return []
         try:
             with open(self.path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             items = [Equipment.from_dict(d) for d in data["equipment"]]
+            known = {f.name for f in fields(Equipment)}
+            self.extra = {str(d.get("id")): {k: v for k, v in d.items() if k not in known}
+                          for d in data["equipment"] if isinstance(d, dict) and d.get("id")}
+            self.extra_top = {k: v for k, v in data.items() if k not in ("version", "groups", "equipment", "lock")}
+            try:
+                self.newer_format = int(data.get("version", 1)) > FORMAT_VERSION
+            except (TypeError, ValueError):
+                self.newer_format = False
             self.groups = self._merge_groups(data.get("groups") or [], items)
             self.lock = _valid_lock(data.get("lock"))
+            self.seen_file = True
             return items
         except OSError as e:
             raise StoreError(
@@ -292,22 +345,35 @@ class EquipmentStore:
     def _write(self, items: list[Equipment], groups=None, lock=_KEEP) -> None:
         groups = self._merge_groups(self.groups if groups is None else groups, items)
         lock = self.lock if lock is self._KEEP else lock
-        tmp = self.path + ".tmp"
+        if self.newer_format:
+            raise StoreError("이 설비 목록은 더 새 버전의 프로그램이 만든 것이라, 이 버전에서는 바꾸지 않습니다.\n"
+                             "[더보기 > 업데이트 확인]으로 프로그램을 업데이트하세요.")
+        if self.seen_file and not os.path.exists(self.path):
+            raise StoreError(f"설비 목록 파일이 보이지 않아 저장하지 않았습니다.\n{self.path}\n\n"
+                             "공유 폴더라면 네트워크 연결을 확인한 뒤 다시 시도하세요.")
+        # 여러 PC 가 같은 공유 폴더에 동시에 저장해도 서로의 임시 파일을 덮지 않게 PC·프로세스마다 다른 이름
+        tmp = f"{self.path}.{_safe_name(socket.gethostname())}-{os.getpid()}.tmp"
         try:
             os.makedirs(self.folder(), exist_ok=True)
             self._daily_backup()
             if os.path.exists(self.path):
                 shutil.copy2(self.path, self.path + ".bak")
-            data = {"version": 1, "groups": groups, "equipment": [asdict(e) for e in items]}
+            data = {**self.extra_top, "version": FORMAT_VERSION, "groups": groups,
+                    "equipment": [{**self.extra.get(e.id, {}), **asdict(e)} for e in items]}
             if lock:
                 data["lock"] = lock
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self.path)
+            _replace_retry(tmp, self.path)
             self.groups, self.lock = groups, lock
+            self.seen_file = True
         except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             raise StoreError(
                 f"설비 목록 파일에 저장할 수 없습니다.\n{self.path}\n\n"
                 f"폴더 쓰기 권한이 있는지, 공유 폴더라면 연결되어 있는지 확인하세요.\n({e})"
@@ -576,7 +642,8 @@ VIEWERS = {
     },
     "tigervnc": {
         "label": "TigerVNC",
-        "args": "{host}::{port}",
+        # TigerVNC 뷰어는 기본이 "단독 접속"이라 같은 설비에 붙어 있던 다른 사람을 끊는다 -> 공유 접속으로
+        "args": "-Shared {host}::{port}",
         "pw": "",
         "paths": [p + r"\TigerVNC\vncviewer.exe" for p in _PF],
     },

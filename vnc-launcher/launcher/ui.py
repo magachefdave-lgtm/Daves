@@ -79,6 +79,7 @@ TRAY_PAD = 6            # 받침판 안쪽 여백
 TRAY_RADIUS = RADIUS + TRAY_PAD
 ICON_ZONES = ("share", "rdp")
 CHECK_SHORT = {"auto": "자동", "port": "VNC 포트", "ping": "ping", "off": "하지 않음"}
+UPDATE_CHECK_HOURS = 3        # 켜 둔 채로 있어도 이만큼마다 새 버전을 확인한다 (latest.json 한 번 읽기)
 RELOCK_SECONDS = 30 * 60   # 편집 잠금을 푼 뒤 이만큼 편집하지 않으면 다시 잠근다
 QUICK = "q"                # 맨 위 "즐겨찾기 · 최근" 줄의 버튼 key 앞에 붙인다
 
@@ -157,6 +158,7 @@ class PillButton(tk.Canvas):
     def __init__(self, parent, text, command, font, colors, bg):
         super().__init__(parent, height=30, highlightthickness=0, bg=bg, cursor="hand2")
         self.font, self.colors, self.command, self.enabled = font, colors, command, True
+        self.shift = False
         self.now = colors[0]
         self.job = None
         self.down = False
@@ -199,6 +201,7 @@ class PillButton(tk.Canvas):
             self.move("all", 0, -1)
             self.down = False
         if self.enabled and 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height():
+            self.shift = bool(event.state & 0x1)   # Shift 를 누른 채 눌렀는지 ([더보기]의 관리자 메뉴)
             self.command()
 
     def set_enabled(self, flag: bool, text: str | None = None):
@@ -237,7 +240,10 @@ class App:
         self.log_pool = ThreadPoolExecutor(max_workers=1)  # 접속 이력은 순서대로, 화면을 막지 않게
         self.results: queue.Queue = queue.Queue()
         self.pending = 0
+        self.inflight: set[str] = set()   # 지금 확인 중인 설비 id
         self.last_check = time.monotonic()  # 마지막 상태 확인이 끝난 때
+        self.last_update_check = time.monotonic()
+        self.rdp_warned = False
         self.checked_at = ""                # 화면에 보일 그 시각
         self.newly_down: list[str] = []     # 이번 확인에서 응답 없음으로 바뀐 설비
         self.unlocked_at = 0.0              # 편집 잠금을 푼(또는 마지막으로 편집한) 때. 0 = 잠김
@@ -432,6 +438,7 @@ class App:
         c.configure(yscrollincrement=TILE_H + GAP)   # draw() 가 버튼 높이에 맞춰 다시 정한다
 
         root.bind("<F5>", lambda _e: (self.reload(), self.check_status()))
+        root.bind("<Map>", self._on_map, add="+")
         root.bind("<Control-f>", lambda _e: self.search.focus_set())
         root.bind("<Escape>", lambda _e: self.selecting and self.end_selection())
         root.bind("<Delete>", self._on_delete_key)
@@ -465,15 +472,22 @@ class App:
                 m.add_command(label="편집 다시 잠그기", command=self.relock)
             else:
                 m.add_command(label="편집 잠금 풀기", command=self._can_edit)
-        m.add_command(label="편집 잠금 설정…", command=self.open_lock)
         m.add_command(label="설정", command=self.open_settings)
-        m.add_separator()
-        m.add_command(label="배포본 만들기…", command=self.make_pack)
         m.add_command(label="업데이트 확인", command=lambda: self.check_update(manual=True))
-        m.add_command(label="업데이트 올리기…", command=self.publish_update)
         m.add_command(label="사용법 보기", command=self.open_guide)
         m.add_command(label="CSV 양식 저장…", command=self.save_templates)
         m.add_command(label="설정 폴더 열기", command=lambda: self._open_path(app_dir()))
+        # 관리자 메뉴: 배포본으로 설치한 PC(부서원)에는 보이지 않는다. 관리자는 Shift+[더보기]로 연다.
+        admin = self.is_admin()
+        if admin or self.more_btn.shift:
+            m.add_separator()
+            m.add_command(label="관리자", state="disabled")
+            m.add_command(label="배포본 만들기…", command=self.make_pack)
+            m.add_command(label="업데이트 올리기…", command=self.publish_update)
+            m.add_command(label="편집 잠금 설정…", command=self.open_lock)
+            m.add_command(label="관리자 메뉴 숨기기 (부서원 PC처럼)" if admin else
+                          "이 PC에서 관리자 메뉴 늘 보이기", command=lambda: self.set_admin(not admin))
+        self.more_btn.shift = False
         b = self.more_btn
         m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 2)
 
@@ -1272,12 +1286,15 @@ class App:
         self.store = EquipmentStore(equipment_file(self.cfg))
         self.log = ConnectionLog(self.store.folder())
 
-    def reload(self) -> bool:
+    def reload(self, quiet: bool = False) -> bool:
         self.seen_mtime = self.store.mtime()
         try:
             self.items = self.store.load()
         except StoreError as e:
-            messagebox.showerror(APP_NAME, str(e))
+            if quiet:   # 저절로 다시 읽을 때 (네트워크가 잠깐 끊긴 경우가 대부분): 보던 목록을 그대로 둔다
+                self.toast("설비 목록 파일에 연결할 수 없습니다. 연결되면 다시 읽습니다.")
+            else:
+                messagebox.showerror(APP_NAME, str(e))
             return False
         if self.group not in [g for g, _n in self._groups()]:
             self.group = ALL_GROUPS
@@ -1289,7 +1306,7 @@ class App:
     def _watch_file(self):
         # 다른 PC가 공유 목록을 바꾸면 따라간다.
         if self.store.mtime() != self.seen_mtime:
-            self.reload()
+            self.reload(quiet=True)
         self.root.after(5000, self._watch_file)
 
     def _write_log(self, action: str, name: str, host: str, note: str = ""):
@@ -1316,6 +1333,21 @@ class App:
         self._summary()
         self.toast(f"편집 잠금을 풀었습니다. {RELOCK_SECONDS // 60}분 동안 편집하지 않으면 다시 잠깁니다.")
         return True
+
+    def is_admin(self) -> bool:
+        """관리자 메뉴(배포본 만들기·업데이트 올리기·편집 잠금 설정)를 늘 보일지.
+        정하지 않았으면: 배포본으로 설치한 PC 는 부서원 PC, 아니면 관리자 PC."""
+        if self.local.admin is not None:
+            return self.local.admin
+        return not self.local.applied_pack
+
+    def set_admin(self, on: bool):
+        if on and not self._can_edit():
+            return
+        self.local.admin = on
+        self.local.save()
+        self.toast("관리자 메뉴를 [더보기]에 늘 보입니다." if on else
+                   "관리자 메뉴를 숨겼습니다. 다시 보려면 Shift를 누른 채 [더보기]를 누르세요.")
 
     def relock(self):
         self.unlocked_at = 0.0
@@ -1351,9 +1383,21 @@ class App:
             self._summary()
             self.toast(f"{RELOCK_SECONDS // 60}분 동안 편집하지 않아 편집을 다시 잠갔습니다.")
         minutes = self.cfg.auto_check_minutes
-        if minutes and self.items and self.pending == 0 and now - self.last_check >= minutes * 60 - 1:
+        # 창을 내려 둔 동안은 아무도 보지 않으므로 설비를 두드리지 않는다 (다시 열면 바로 확인)
+        if (minutes and self.items and self.pending == 0 and now - self.last_check >= minutes * 60 - 1
+                and self.root.state() != "iconic"):
             self.check_status(quiet=True)
+        if now - self.last_update_check >= UPDATE_CHECK_HOURS * 3600:   # 며칠씩 켜 둔 PC 도 새 버전을 알도록
+            self.check_update(manual=False)
         self.root.after(15000, self._tick_clock)
+
+    def _on_map(self, event):
+        """창을 다시 열었을 때: 내려 둔 동안 쉬었던 자동 확인을 바로 한다."""
+        if event.widget is not self.root:
+            return
+        minutes = self.cfg.auto_check_minutes
+        if minutes and self.items and self.pending == 0 and time.monotonic() - self.last_check >= minutes * 60 - 1:
+            self.check_status(quiet=True)
 
     # ------------------------------------------------------------ 동작 ---
 
@@ -1422,6 +1466,14 @@ class App:
             return
         if self._reuse(eq, "RDP") or not self._confirm_caution(eq):
             return
+        if not self.rdp_warned:
+            if not messagebox.askyesno(APP_NAME, (
+                    f"{eq.name}에 원격 데스크톱으로 접속합니다.\n\n"
+                    "VNC와 달리 원격 데스크톱은 설비 앞의 화면을 잠그고, 설비에 로그인해 있던 사람의 "
+                    "연결을 끊을 수 있습니다. 설비가 운전 중이면 VNC로 접속하세요.\n\n계속할까요?"),
+                    icon="warning", default="no"):
+                return
+            self.rdp_warned = True   # 프로그램을 켤 때마다 한 번만 묻는다
         try:
             proc = launch(rdp_command(eq))
         except OSError as e:
@@ -1826,6 +1878,8 @@ class App:
                                               "[더보기 > 설정]에서 '업데이트 폴더'를 지정하세요.")
             return
 
+        self.last_update_check = time.monotonic()
+
         def work():
             try:
                 self._update_result = (read_latest(folder), None, manual)
@@ -1945,6 +1999,7 @@ class App:
             return False
         ok = self._apply_pack(pack)
         self.local.applied_pack = pack["id"]
+        self.local.admin = False          # 배포본을 받은 PC = 부서원 PC (관리자 메뉴 숨김)
         self.local.save()
         return ok
 
@@ -2076,6 +2131,10 @@ class App:
         items = list(self.items if items is None else items)
         if not items:
             return
+        # 확인 중인 설비는 또 두드리지 않는다 (F5 를 누르고 있으면 설비마다 수십 번 두드리게 된다)
+        items = [e for e in items if e.id not in self.inflight]
+        if not items:
+            return
         timeout = self.cfg.check_timeout
         for e in items:
             method = check_method(e)
@@ -2085,6 +2144,7 @@ class App:
             if not quiet and self.status.get(e.id) is None:
                 self.status[e.id] = "busy"
             self.pending += 1
+            self.inflight.add(e.id)
             self.pool.submit(self._probe, e.id, e.host, e.port, timeout, method)
         if not self.pending:
             return
@@ -2110,6 +2170,7 @@ class App:
                 break
             got = True
             self.pending -= 1
+            self.inflight.discard(eq_id)
             cur = by_id.get(eq_id)
             if cur and (cur.host, cur.port) == (host, port):
                 if self.status.get(eq_id) is True and ok is False:
@@ -2124,6 +2185,7 @@ class App:
             self._update_checked(info, error, manual)
         if got and self.pending <= 0:   # 한 번의 확인이 끝났다
             self.pending = 0
+            self.inflight.clear()
             self.last_check = time.monotonic()
             self.checked_at = time.strftime("%H:%M")
             self._summary()

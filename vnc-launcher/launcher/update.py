@@ -114,12 +114,27 @@ def _writable(folder: str) -> bool:
         return False
 
 
+def is_network_path(path: str) -> bool:
+    r"""\\서버\공유 또는 네트워크 드라이브(Z: 등)에 있는지."""
+    if path.startswith(("\\\\", "//")):
+        return True
+    path = os.path.abspath(path)
+    if os.name == "nt" and len(path) >= 2 and path[1] == ":":
+        try:
+            import ctypes
+            return ctypes.windll.kernel32.GetDriveTypeW(path[:2] + "\\") == 4   # DRIVE_REMOTE
+        except Exception:
+            return False
+    return False
+
+
 def install(folder: str, info: dict, current_exe: str, fallback_dir: str) -> str:
     """새 exe 를 받아 지금 exe 자리에 놓는다. 새 exe 의 경로를 돌려준다.
-    지금 exe 의 폴더에 쓸 수 없으면 fallback_dir 에 받는다."""
+    지금 exe 의 폴더에 쓸 수 없거나 그 폴더가 네트워크에 있으면 fallback_dir 에 받는다
+    (공유 폴더의 exe 를 여러 PC 가 실행 중일 때 한 PC 가 그 파일을 바꿔 치우지 않게)."""
     src = os.path.join(folder, os.path.basename(info.get("file") or EXE))
     here = os.path.dirname(os.path.abspath(current_exe))
-    in_place = _writable(here)
+    in_place = not is_network_path(here) and _writable(here)
     target = os.path.abspath(current_exe) if in_place else os.path.join(fallback_dir, EXE)
     new, old = target + ".new", target + ".old"
     try:

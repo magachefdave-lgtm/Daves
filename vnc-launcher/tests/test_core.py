@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -445,3 +446,66 @@ def test_ping_never_raises():
     if sys.platform == "win32":   # 실제 네트워크에서만 (개발용 가상 환경은 아무 주소에나 가짜로 응답한다)
         assert core.ping("127.0.0.1", 1.0) is True
         assert core.ping("192.0.2.1", 0.5) is False              # 문서용 주소: 응답이 오지 않는다
+
+
+# ---------------------------------------------------- 외부에 주는 영향 (점검에서 나온 것) ---
+
+def test_zero_padded_ip_is_read_as_decimal():
+    # 그대로 두면 Windows 가 010 을 8진수(8)로 읽어 다른 설비에 접속한다
+    assert core.Equipment.from_dict({"name": "A", "host": "192.168.010.011"}).host == "192.168.10.11"
+    assert core.normalize_host(" equip-01 ") == "equip-01"
+
+
+@pytest.mark.parametrize("host", ["192.168.10", "0x0a000001", "10.0.0.256", "167772161", "1.2.3.4.5"])
+def test_ambiguous_numeric_hosts_are_rejected(host):
+    assert any("IP는" in m for m in core.validate(core.Equipment(name="A", host=host)))
+
+
+@pytest.mark.parametrize("host", ["192.168.10.11", "0.0.0.0", "equip-01", "etch01.fab.local", "10.0.0.1"])
+def test_normal_hosts_still_accepted(host):
+    assert core.validate(core.Equipment(name="A", host=host)) == []
+
+
+def test_fields_from_newer_versions_survive_a_save(tmp_path):
+    path = tmp_path / "equipment.json"
+    path.write_text(json.dumps({"version": 1, "future_top": 7, "groups": [], "equipment": [
+        {"id": "a1", "name": "A", "host": "10.0.0.1", "vnc_server": "tigervnc"}]}), encoding="utf-8")
+    store = core.EquipmentStore(str(path))
+    store.add(core.Equipment(name="B", host="10.0.0.2"))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["future_top"] == 7
+    assert next(d for d in data["equipment"] if d["id"] == "a1")["vnc_server"] == "tigervnc"
+
+
+def test_newer_format_is_read_but_not_written(tmp_path):
+    path = tmp_path / "equipment.json"
+    path.write_text(json.dumps({"version": core.FORMAT_VERSION + 1, "equipment": [
+        {"id": "a1", "name": "A", "host": "10.0.0.1"}]}), encoding="utf-8")
+    store = core.EquipmentStore(str(path))
+    assert [e.name for e in store.load()] == ["A"]
+    with pytest.raises(core.StoreError):
+        store.add(core.Equipment(name="B", host="10.0.0.2"))
+    assert "B" not in path.read_text(encoding="utf-8")
+
+
+def test_list_vanishing_mid_session_is_an_error_not_an_empty_list(tmp_path):
+    # 네트워크가 잠깐 끊겨 파일이 안 보일 때 빈 목록으로 저장해 공유 목록을 지우면 안 된다
+    path = tmp_path / "equipment.json"
+    store = core.EquipmentStore(str(path))
+    store.add(core.Equipment(name="A", host="10.0.0.1"))
+    os.rename(path, tmp_path / "away.json")
+    with pytest.raises(core.StoreError):
+        store.load()
+    with pytest.raises(core.StoreError):
+        store.add(core.Equipment(name="B", host="10.0.0.2"))
+    assert not path.exists()
+    os.rename(tmp_path / "away.json", path)                     # 연결이 돌아오면 그대로
+    assert [e.name for e in store.load()] == ["A"]
+
+
+def test_first_run_still_creates_the_list(tmp_path):
+    store = core.EquipmentStore(str(tmp_path / "new" / "equipment.json"))
+    assert store.load() == []
+    store.add(core.Equipment(name="A", host="10.0.0.1"))
+    assert [e.name for e in store.load()] == ["A"]
+    assert not [n for n in os.listdir(tmp_path / "new") if n.endswith(".tmp")]

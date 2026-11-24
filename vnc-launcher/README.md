@@ -14,7 +14,7 @@
 | --- | --- |
 | `launcher/core.py` | 설비 목록 저장(편집 잠금, 날짜별 백업 포함), CSV, 설정, VNC·RDP 명령 구성 |
 | `launcher/local.py` | 이 PC에만 남기는 것: 즐겨찾기, 창 크기·위치, 마지막 그룹 |
-| `launcher/pack.py` | 배포본: 설정·목록·비밀번호(배포 암호로 다시 암호화)를 exe 끝에 붙인다. `더보기 > 배포본 만들기` |
+| `launcher/pack.py` | 배포본: 설정·목록·비밀번호(배포 암호로 다시 암호화)를 exe 끝에 붙인다. `더보기 > 관리자 > 배포본 만들기` (관리자 메뉴는 배포본으로 설치한 PC 에서 숨김, Shift+더보기로 열기) |
 | `launcher/update.py` | 서버(공유) 폴더를 통한 업데이트: 올리기(`latest.json` + exe), 확인, 받아서 바꾸고 다시 켜기 |
 | `launcher/history.py` | 접속 이력 (설비 목록 옆에 달마다 CSV) |
 | `launcher/secret.py` | VNC 비밀번호 보관 (Windows DPAPI) |
@@ -52,3 +52,20 @@ PIN 을 잊으면 `EquipmentRemote.exe --reset-pin`.
 참고: [Going Gray: A New HMI Standard](https://control.com/technical-articles/going-gray/),
 [SoftPerfect PingMonitor tile view](https://www.softperfect.com/products/toolkit/pingmonitor/manual/tile-view.htm),
 [Windows 앱 색 지침](https://learn.microsoft.com/windows/apps/design/style/color)
+
+## 설비·서버에 주는 영향 (점검 결과와 안전장치)
+
+여러 PC 가 하루 종일 켜 두는 프로그램이라, 설비와 공유 폴더 쪽에 무엇을 하는지 점검해 막아 두었다.
+
+| 무엇 | 안전장치 |
+|---|---|
+| 상태 확인 (Windows 설비 = VNC 포트, Linux = ping) | TigerVNC 는 로그인 없이 끊긴 연결을 "보안 실패"로 세어 PC 를 막는다 → Linux 는 ping. 같은 설비를 동시에 두 번 확인하지 않음(F5 연타), 창을 내려 두면 쉼. Linux 설비를 VNC 포트로 바꾸면 경고 |
+| 실제 서버 시험 | `.github/workflows/vnc-server-check.yml`: TigerVNC(Xvnc, x0vncserver)·x11vnc·UltraVNC·TightVNC 를 띄우고 300번 확인한 뒤 진짜 VNC 로그인이 되는지 확인 (`tools/vnc_server_check.py`) |
+| 공유 설비 목록 | 파일이 잠깐 안 보이면(네트워크) 빈 목록으로 저장하지 않음. PC 마다 다른 임시 파일 이름, 바꾸기 재시도. 이 버전이 모르는 항목(새 버전이 넣은 것)도 지우지 않음. 새 형식 파일은 읽기만 |
+| IP 입력 | `192.168.010.011`(Windows 는 8진수로 읽어 다른 설비에 접속), `192.168.10`, `0x..` 같은 표기를 막거나 고침 |
+| 업데이트 | 3시간마다 latest.json 확인. exe 가 공유 폴더에 있으면 그 자리에서 바꾸지 않고 설정 폴더에 받음 |
+| 뷰어 | TigerVNC 뷰어는 `-Shared` (기본이 단독 접속이라 같은 설비의 다른 사람을 끊음) |
+| 원격 데스크톱 | 설비 앞 화면이 잠기고 로그인한 사람이 끊길 수 있음 → 켤 때마다 처음 한 번 확인 |
+
+남은 것 (알고 둔 것): VNC 비밀번호가 뷰어 명령줄에 들어감(UltraVNC 의 방식) - 보안 프로그램이 명령줄을 기록하면 남는다.
+접속 이력 CSV 를 공유 폴더에 두면 여러 PC 가 동시에 쓸 때 드물게 한 줄이 빠질 수 있다.

@@ -1,4 +1,4 @@
-"""이 PC에만 남기는 것: 즐겨찾기, 창 크기·위치, 마지막으로 본 그룹.
+"""이 PC에만 남기는 것: 즐겨찾기, 창 크기·위치, 마지막으로 본 그룹, 관리자 메뉴 표시.
 
 설비 목록(공유될 수 있음)과 달리 사람마다 다른 것이라 설정 폴더(core.app_dir)의 ui_state.json 에 둔다.
 파일이 없거나 깨져 있으면 기본값으로 시작한다 - 이 파일 때문에 프로그램이 멈추면 안 된다.
@@ -18,6 +18,7 @@ class LocalState:
         self.zoomed = False
         self.group = ""
         self.applied_pack = ""           # 이미 가져온 배포본 id (같은 배포본을 다시 묻지 않게)
+        self.admin: bool | None = None   # 관리자 메뉴를 늘 보일지 (None = 배포본으로 설치했는지로 정함)
         self.load()
 
     def _read(self) -> dict | None:
@@ -50,11 +51,13 @@ class LocalState:
         self.zoomed = data.get("zoomed") is True
         self.group = data.get("group") if isinstance(data.get("group"), str) else ""
         self.applied_pack = data.get("applied_pack") if isinstance(data.get("applied_pack"), str) else ""
+        self.admin = data.get("admin") if isinstance(data.get("admin"), bool) else None
 
     def save(self) -> bool:
         tmp = self.path + ".tmp"
         data = {"favorites": self.favorites, "geometry": self.geometry,
-                "zoomed": self.zoomed, "group": self.group, "applied_pack": self.applied_pack}
+                "zoomed": self.zoomed, "group": self.group, "applied_pack": self.applied_pack,
+                "admin": self.admin}
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
