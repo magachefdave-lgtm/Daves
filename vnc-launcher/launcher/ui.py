@@ -44,7 +44,7 @@ TRAY = "#e2e5e9"        # 그룹 받침판
 TRAY_LINE = "#d5d9df"
 CARD = "#ffffff"        # 대화상자, 메뉴
 TILE = "#fdfdfe"        # 설비 버튼 (정상)
-BORDER = "#dfe3e8"      # 버튼 테두리 (머리카락 굵기)
+BORDER = "#e2e6eb"      # 버튼 테두리 (머리카락 굵기)
 SHADOW = "#cfd4db"      # 버튼 아래 옅은 그림자
 SHADOW_DEEP = "#b3bac4"
 TEXT = "#171c22"
@@ -69,8 +69,10 @@ CAUTION = "#c27c0e"     # 주의 표시 (PM 중 등)
 CAUTION_BG = "#fdf3dd"
 CAUTION_LINE = "#e9c681"
 CAUTION_TEXT = "#6b4400"
-NORMAL = "#5b8a72"      # 정상: 채도를 낮춘 녹색 점
 IDLE = "#98a2ae"
+ICON_QUIET = "#c3cad3"  # 평소의 공유폴더·원격 데스크톱 아이콘 (마우스를 올린 버튼에서만 진해진다)
+NAME_X = 16             # 설비 이름이 시작하는 위치 (버튼 왼쪽에서)
+STRIP_X, STRIP_W = 6, 3 # 상태 막대 (왼쪽 세로 막대) 위치·굵기
 STATUS_WORD = {True: "접속 가능", False: "응답 없음", "busy": "확인 중"}
 RADIUS = 10             # 설비 버튼 모서리
 TRAY_PAD = 6            # 받침판 안쪽 여백
@@ -81,7 +83,7 @@ RELOCK_SECONDS = 30 * 60   # 편집 잠금을 푼 뒤 이만큼 편집하지 않
 QUICK = "q"                # 맨 위 "즐겨찾기 · 최근" 줄의 버튼 key 앞에 붙인다
 
 # 버튼의 평소 모습: (바탕, 테두리, 글자, 아이콘, 그림자, 테두리 굵기, 접속 중인지)
-BLANK = (TILE, BORDER, TEXT, IDLE, SHADOW, 1, False)
+BLANK = (TILE, BORDER, TEXT, ICON_QUIET, SHADOW, 1, False)
 
 
 def mix(a: str, b: str, t: float) -> str:
@@ -372,8 +374,8 @@ class App:
 
         foot = tk.Frame(root, bg=BG)
         foot.pack(side="bottom", fill="x")
-        for mark, color, word in (("▮", ACCENT, "접속 중"), ("▲", CAUTION, "주의"), ("■", ALERT, "응답 없음"),
-                                  ("○", IDLE, "미확인"), ("●", NORMAL, "정상")):
+        # 범례는 이상 상태만 - 정상은 아무 표시 없는 이름판이다
+        for mark, color, word in (("▮", ACCENT, "접속 중"), ("▲", CAUTION, "주의"), ("■", ALERT, "응답 없음")):
             tk.Label(foot, text=word, bg=BG, fg=SUB, font=self.f_small).pack(side="right", padx=(0, 14))
             tk.Label(foot, text=mark, bg=BG, fg=color, font=self.f_small).pack(side="right", padx=(0, 3))
         self.foot_var = tk.StringVar()
@@ -670,7 +672,8 @@ class App:
     def _need(self, e: Equipment) -> int:
         """설비명이 잘리지 않으려면 필요한 버튼 폭."""
         icons = self._share_on(e) + self._rdp_on(e)
-        return self.f_name.measure(e.name) + 26 + 8 + ICON_STEP * icons + (18 if e.caution else 0)
+        marks = (18 if e.caution else 0) + (18 if self.status.get(e.id) is False else 0)
+        return self.f_name.measure(e.name) + NAME_X + 8 + ICON_STEP * icons + marks
 
     def _summary(self):
         parts = [f"전체 {len(self.items)}대"]
@@ -824,8 +827,8 @@ class App:
             look = (ALERT_BG, ALERT_LINE, ALERT_TEXT, ALERT_TEXT, mix(SHADOW, ALERT, 0.15))
         elif e.caution:
             look = (CAUTION_BG, CAUTION_LINE, CAUTION_TEXT, CAUTION_TEXT, mix(SHADOW, CAUTION, 0.15))
-        else:
-            look = (TILE, BORDER, TEXT, IDLE, SHADOW)
+        else:   # 정상·미확인: 아무 표시 없는 이름판
+            look = (TILE, BORDER, TEXT, ICON_QUIET, SHADOW)
         if a < 1:   # 나타나는 중: 받침판 색에서 제 색으로
             look = tuple(mix(TRAY, col, a) for col in look)
         fill, outline, ink, icon, shadow = look
@@ -840,32 +843,40 @@ class App:
                    tags=(f"shadow:{key}",))
         round_rect(c, x, y, x + w, y + th, RADIUS, fill=fill, outline=outline, width=line_w,
                    tags=body + (f"card:{key}",))
-        # 상태 표시: 색을 못 가려도 알 수 있게 모양도 다르게 한다.
-        if trying:   # 접속 시도 중: 버튼 아래쪽을 막대가 오간다 (_sweep 이 움직인다)
-            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=ACCENT, width=2, tags=body)
+        # 상태 표시: 이상할 때만 왼쪽에 세로 막대 하나. 정상은 아무것도 그리지 않는다.
+        strip = None
+        if trying:   # 접속 시도 중: 파란 막대 + 버튼 아래쪽을 막대가 오간다 (_sweep 이 움직인다)
+            strip = ACCENT
             self.boxes[key] = (x, y, w)
             c.create_rectangle(0, 0, 0, 0, fill=ACCENT, outline="", tags=body + (f"sweep:{key}",))
             self._place_sweep(key)
         elif active:
-            c.create_rectangle(x + 12, mid - 6, x + 16, mid + 6, fill=ink, outline="", tags=body)
+            strip = "#ffffff"
         elif st is False:
-            c.create_rectangle(x + 10, mid - 4, x + 18, mid + 4, fill=mix(TRAY, ALERT, a), outline="", tags=body)
-        elif st is True:
-            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=mix(TRAY, NORMAL, a), outline="", tags=body)
-        else:
-            c.create_oval(x + 10, mid - 4, x + 18, mid + 4, fill=fill, outline=icon, width=2, tags=body)
+            strip = ALERT
+        elif e.caution:
+            strip = CAUTION
+        if strip:
+            sy = 8 if th >= 34 else 7
+            round_rect(c, x + STRIP_X, y + sy, x + STRIP_X + STRIP_W, y + th - sy, 1,
+                       fill=mix(fill, strip, a), outline="", tags=body)
         right = x + w - 6
         for kind, on in (("share", self._share_on(e)), ("rdp", self._rdp_on(e))):
-            if on:   # 평소엔 가는 선 아이콘만, 마우스를 올리면 동그란 버튼
+            if on:   # 평소엔 옅은 선 아이콘만, 마우스를 올린 버튼에서 진해지고 아이콘 위에서는 동그란 버튼
                 self._icon(kind, key, e.id, right - ICON_STEP / 2, mid, fill, icon)
                 right -= ICON_STEP
-        if e.caution:   # 주의 표시: 주황 삼각형
+        # 모양 표시 (색을 못 가려도 알 수 있게): 응답 없음 ■, 주의 ▲
+        if st is False and not active and not trying:
             cx = right - 7
-            c.create_polygon(cx, mid - 6, cx + 7, mid + 6, cx - 7, mid + 6, fill=mix(TRAY, CAUTION, a),
+            c.create_rectangle(cx - 4, mid - 4, cx + 4, mid + 4, fill=mix(fill, ALERT, a), outline="", tags=body)
+            right -= 18
+        if e.caution:
+            cx = right - 7
+            c.create_polygon(cx, mid - 6, cx + 7, mid + 6, cx - 7, mid + 6, fill=mix(fill, CAUTION, a),
                              outline="#ffffff" if active else "", tags=body)
             right -= 18
-        c.create_text(x + 26, mid, anchor="w", font=self.f_name, tags=body, fill=ink,
-                      text=self._fit(e.name, self.f_name, right - (x + 26)))
+        c.create_text(x + NAME_X, mid, anchor="w", font=self.f_name, tags=body, fill=ink,
+                      text=self._fit(e.name, self.f_name, right - (x + NAME_X)))
 
     def _icon(self, kind: str, key: str, eq_id: str, cx: float, mid: float, fill: str, icon: str):
         """공유폴더(폴더)·원격 데스크톱(모니터) 아이콘. 선 모양은 ico:, 채운 모양은 icf: 태그."""
