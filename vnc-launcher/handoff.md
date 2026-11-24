@@ -86,6 +86,11 @@ py -3 -m PyInstaller --noconfirm --clean --onefile --noconsole --name EquipmentR
 3. 봇 커밋("Add built EquipmentRemote.exe")이 올라오면 `git pull` → `release/EquipmentRemote.exe`
 4. 관리자 PC 에서 새 exe 실행 → Shift+[더보기] > 관리자 > 업데이트 올리기 → 각 PC 에 업데이트 버튼
 
+사용자에게 전달할 때는 **GitHub 링크**를 준다 (회사 PC 에서 Claude 앱의 파일 카드로는 exe 를 받을 수 없었다):
+`https://github.com/magachefdave-lgtm/Daves/raw/<봇 커밋 전체 SHA>/release/EquipmentRemote.exe` (버전 고정),
+`https://github.com/magachefdave-lgtm/Daves/raw/ccr-b9d67696-e8fnho/release/EquipmentRemote.exe` (늘 최신).
+주기 전에 curl 로 받아 sha256 이 같은지 확인한다. 규칙 전체는 저장소 루트의 `CLAUDE.md`.
+
 ## 6. 데이터와 파일 위치
 
 | 파일 | 위치 | 내용 |
