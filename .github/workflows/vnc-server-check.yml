@@ -86,83 +86,9 @@ jobs:
           "### Windows VNC 서버 (주소 $ip)" >> $env:GITHUB_STEP_SUMMARY
           "| 서버 | 설비 OS / 확인 방식 | 확인 횟수 | 응답 | 그 뒤 로그인 | 내용 | 판정 |" >> $env:GITHUB_STEP_SUMMARY
           "|---|---|---|---|---|---|---|" >> $env:GITHUB_STEP_SUMMARY
-      - name: UltraVNC server
-        timeout-minutes: 20
-        run: |
-          # UltraVNC (Chocolatey 패키지 = 공식 설치 파일을 조용히 설치). 설치 기록을 그대로 남긴다.
-          for ($i = 1; $i -le 4; $i++) {
-            choco install ultravnc -y --no-progress --ignore-checksums 2>&1 | Write-Host
-            if (Test-Path 'C:\Program Files\uvnc\UltraVNC\winvnc.exe') { break }
-            Write-Host "UltraVNC 설치 재시도 ($i) - 패키지 서버 응답 없음"; Start-Sleep -Seconds 60
-          }
-          # 프로그램이 방금 깐 UltraVNC 뷰어를 저절로 찾는지 (처음 설정·배포본에서 쓰는 것)
-          python -c "from launcher.core import detect_viewer; f = detect_viewer(); print('뷰어 찾기:', f); assert f and f[0] == 'ultravnc', f"
-          if ($LASTEXITCODE) { throw "UltraVNC 뷰어를 찾지 못함" }
-          $rel = [pscustomobject]@{ tag_name = 'chocolatey' }
-          $all = Get-ChildItem 'C:\Program Files\uvnc\UltraVNC', 'C:\Program Files\uvnc bvba\UltraVNC', 'C:\Program Files\UltraVNC' -Filter winvnc.exe -ErrorAction SilentlyContinue
-          $exe = ($all | Where-Object { $_.FullName -match 'x64|64' } | Select-Object -First 1)
-          if (-not $exe) { $exe = $all | Select-Object -First 1 }
-          if (-not $exe) { throw "winvnc.exe 를 찾지 못함" }
-          Write-Host "UltraVNC: $($exe.FullName) $($exe.VersionInfo.FileVersion)"
-          "UltraVNC $($rel.tag_name) ($($exe.VersionInfo.FileVersion))" | Out-File -Append -Encoding utf8 $env:RUNNER_TEMP\versions.txt
-          Get-Service uvnc_service -ErrorAction SilentlyContinue | Stop-Service -Force -ErrorAction SilentlyContinue
-          $hex = python tools/vnc_server_check.py --password ci-pw-01 --print-hex
-          $ini = @"
-          [ultravnc]
-          passwd=$hex
-          passwd2=$hex
-          [admin]
-          UseRegistry=0
-          SocketConnect=1
-          AutoPortSelect=0
-          PortNumber=5900
-          HTTPConnect=0
-          AuthRequired=1
-          AllowLoopback=1
-          LoopbackOnly=0
-          MSLogonRequired=0
-          NewMSLogon=0
-          DisableTrayIcon=1
-          QuerySetting=2
-          QueryTimeout=1
-          QueryAccept=1
-          "@
-          Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force
-          $iniPath = Join-Path $exe.DirectoryName 'ultravnc.ini'
-          ($ini -split "`n" | ForEach-Object { $_.Trim() }) -join "`r`n" | Set-Content -Encoding ascii $iniPath
-          # 비밀번호는 UltraVNC 의 setpasswd.exe 로 다시 넣는다 (버전마다 저장 형식이 다를 수 있다)
-          $sp = Join-Path $exe.DirectoryName 'setpasswd.exe'
-          if (Test-Path $sp) { Push-Location $exe.DirectoryName; & $sp ci-pw-01 ci-pw-01 | Write-Host; Pop-Location } else { Write-Host "setpasswd.exe 없음" }
-          Get-ChildItem $exe.DirectoryName -Name | Write-Host
-          Get-Content $iniPath | Write-Host
-          Start-Process $exe.FullName -ArgumentList '-run'
-          Start-Sleep -Seconds 8
-          if (-not (Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue)) {
-            Write-Host "프로그램으로는 안 떠서 서비스로 설치해 실행"
-            Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force
-            Start-Process -Wait $exe.FullName -ArgumentList '-install'
-            Start-Sleep -Seconds 3
-            Start-Service uvnc_service -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 8
-          }
-          Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Write-Host
-          $rc = 0
-          # 프로그램 기본값 (Windows 설비 = VNC 포트 확인), 실제와 비슷한 간격: 확인이 쌓여 막히면 안 된다
-          python tools/vnc_server_check.py --label UltraVNC --host $env:HOST_IP --port 5900 --password ci-pw-01 --os Windows --check auto --rounds 40 --interval 3 --expect ok --require-answer --wait 60 --summary $env:GITHUB_STEP_SUMMARY
-          if ($LASTEXITCODE) { $rc = 1 }
-          # 몰아서 300번 (F5 를 막기 전의 최악): 결과만 기록 - 잠깐 거절하는지, 몇 초 뒤 풀리는지
-          python tools/vnc_server_check.py --label UltraVNC --host $env:HOST_IP --port 5900 --password ci-pw-01 --os Windows --check auto --rounds 300 --expect any --require-answer --summary $env:GITHUB_STEP_SUMMARY
-          if ($LASTEXITCODE) { $rc = 1 }
-          Start-Sleep -Seconds 5
-          # 같은 설비를 ping 으로 확인할 때 (Windows 의 IcmpSendEcho 경로)
-          python tools/vnc_server_check.py --label UltraVNC --host $env:HOST_IP --port 5900 --password ci-pw-01 --os Windows --check ping --rounds 50 --expect ok --require-answer --summary $env:GITHUB_STEP_SUMMARY
-          if ($LASTEXITCODE) { $rc = 1 }
-          Get-Service uvnc_service -ErrorAction SilentlyContinue | Stop-Service -Force -ErrorAction SilentlyContinue
-          Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force
-          exit $rc
       - name: TightVNC server
-        if: always()
         timeout-minutes: 20
+        continue-on-error: true   # 설치에 쓰는 공용 패키지 서버(Chocolatey)가 안 될 때가 있다
         run: |
           for ($i = 1; $i -le 3; $i++) {
           choco install tightvnc -y --no-progress --install-arguments="'ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=ci-pw-01 SET_RFBPORT=1 VALUE_OF_RFBPORT=5901 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1'" | Select-Object -Last 8

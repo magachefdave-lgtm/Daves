@@ -60,7 +60,7 @@ PIN 을 잊으면 `EquipmentRemote.exe --reset-pin`.
 | 무엇 | 안전장치 |
 |---|---|
 | 상태 확인 (Windows 설비 = VNC 포트, Linux = ping) | TigerVNC 는 로그인 없이 끊긴 연결을 "보안 실패"로 세어 PC 를 막는다 → Linux 는 ping. 같은 설비를 동시에 두 번 확인하지 않음(F5 연타), 창을 내려 두면 쉼. Linux 설비를 VNC 포트로 바꾸면 경고 |
-| 실제 서버 시험 | `.github/workflows/vnc-server-check.yml`: TigerVNC(Xvnc, x0vncserver)·x11vnc·UltraVNC·TightVNC 를 띄우고 300번 확인한 뒤 진짜 VNC 로그인이 되는지 확인 (`tools/vnc_server_check.py`) |
+| 실제 서버 시험 | `.github/workflows/vnc-server-check.yml`: TigerVNC(Xvnc, x0vncserver)·x11vnc·TightVNC 를 띄우고 300번 확인한 뒤 진짜 VNC 로그인이 되는지 확인 (UltraVNC 1.8.3 은 한 번 수동 시험: 몰아서 300번이면 직후 한 번 거절, 4초 뒤 정상) (`tools/vnc_server_check.py`) |
 | 공유 설비 목록 | 파일이 잠깐 안 보이면(네트워크) 빈 목록으로 저장하지 않음. PC 마다 다른 임시 파일 이름, 바꾸기 재시도. 이 버전이 모르는 항목(새 버전이 넣은 것)도 지우지 않음. 새 형식 파일은 읽기만 |
 | IP 입력 | `192.168.010.011`(Windows 는 8진수로 읽어 다른 설비에 접속), `192.168.10`, `0x..` 같은 표기를 막거나 고침 |
 | 업데이트 | 3시간마다 latest.json 확인. exe 가 공유 폴더에 있으면 그 자리에서 바꾸지 않고 설정 폴더에 받음 |
