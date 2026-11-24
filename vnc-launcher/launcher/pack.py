@@ -155,8 +155,9 @@ def unseal(sealed: dict, passphrase: str):
 
 
 def make_payload(config: dict, equipment: dict | None, passwords: dict[str, str] | None,
-                 passphrase: str) -> dict:
-    """배포본에 넣을 내용. equipment 는 {"groups": [...], "items": [...]} 또는 None(공유 목록을 쓸 때)."""
+                 passphrase: str, update_key: str = "") -> dict:
+    """배포본에 넣을 내용. equipment 는 {"groups": [...], "items": [...]} 또는 None(공유 목록을 쓸 때).
+    update_key: 받는 PC가 믿을 업데이트 서명 키 (공개 키 16진수, 없으면 "")."""
     try:
         user = getpass.getuser()
     except Exception:
@@ -169,4 +170,5 @@ def make_payload(config: dict, equipment: dict | None, passwords: dict[str, str]
         "equipment": equipment,
         "passwords": seal(passwords, passphrase) if passwords else None,
         "password_count": len(passwords or {}),
+        "update_key": update_key,
     }

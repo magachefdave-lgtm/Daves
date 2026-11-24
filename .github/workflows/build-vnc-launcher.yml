@@ -11,6 +11,35 @@ permissions:
   contents: write
 
 jobs:
+  # 화면 시험 (tests/test_ui.py): 실제 Tk 창을 Xvfb 에 띄우고 누르고 확인한다. Windows 작업의 pytest 에서도
+  # 같은 파일이 돌지만 화면·포커스를 못 받으면 건너뛰므로, 여기서는 반드시 돌게 한다 (건너뛰면 실패).
+  ui-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vnc-launcher
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Xvfb, window manager, Korean font
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb twm fonts-nanum
+          python -m pip install pytest
+      # twm 은 기본으로 새 창을 마우스로 놓기를 기다린다 -> RandomPlacement 를 꼭 넣는다 (없으면 멈춘다)
+      # REQUIRE_UI_TESTS=1: 화면 시험을 건너뛰지 않고 실패로 본다
+      - name: Test with a screen
+        timeout-minutes: 10
+        env:
+          REQUIRE_UI_TESTS: "1"
+        run: |
+          printf 'RandomPlacement\nNoTitle\n' > "$HOME/.twmrc"
+          xvfb-run -a -s "-screen 0 1280x800x24" sh -c 'twm >/dev/null 2>&1 & sleep 3; python -m pytest -q -rs tests'
+
   build:
     runs-on: windows-latest
     defaults:

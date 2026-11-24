@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import sys
 
 import pytest
@@ -509,6 +510,297 @@ def test_first_run_still_creates_the_list(tmp_path):
     store.add(core.Equipment(name="A", host="10.0.0.1"))
     assert [e.name for e in store.load()] == ["A"]
     assert not [n for n in os.listdir(tmp_path / "new") if n.endswith(".tmp")]
+
+
+# ------------------------------------------------------------ 저장 잠금 ---
+
+def test_concurrent_saves_from_two_pcs_keep_both(tmp_path):
+    import threading
+    path = str(tmp_path / "equipment.json")
+    errors = []
+
+    def pc(prefix):
+        s = EquipmentStore(path)       # PC 마다 따로 연 저장소
+        try:
+            for i in range(20):
+                s.add(eq(f"{prefix}-{i}", f"10.0.{1 if prefix == 'A' else 2}.{i + 1}"))
+        except Exception as e:          # pragma: no cover - 실패하면 아래에서 보인다
+            errors.append(e)
+
+    threads = [threading.Thread(target=pc, args=(p,)) for p in "AB"]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert len(EquipmentStore(path).load()) == 40
+    assert not os.path.exists(path + ".lock")
+
+
+def test_lock_released_after_error(store):
+    store.add(eq("A"))
+    with pytest.raises(StoreError):
+        store.add(eq("A"))              # 같은 이름 -> 오류
+    assert not os.path.exists(store.lock_path())
+    store.add(eq("B", "10.0.0.2"))
+
+
+def test_fresh_lock_of_other_pc_times_out(store, monkeypatch):
+    store.add(eq("A"))
+    with open(store.lock_path(), "w", encoding="utf-8") as f:
+        f.write("OTHER-PC\t123\tabc\t2026-11-24 10:00:00\n")
+    monkeypatch.setattr(core, "LOCK_WAIT", 0.3)
+    store.sleep = lambda s: None
+    with pytest.raises(StoreError) as e:
+        store.add(eq("B", "10.0.0.2"))
+    assert "다른 PC가 설비 목록을 저장" in str(e.value) and "OTHER-PC" in str(e.value)
+    assert os.path.exists(store.lock_path())                 # 남의 잠금은 지우지 않는다
+    assert [x.name for x in store.load()] == ["A"]
+
+
+def test_stale_lock_is_broken(store):
+    store.add(eq("A"))
+    with open(store.lock_path(), "w", encoding="utf-8") as f:
+        f.write("DEAD-PC\t1\tdead\t2026-11-24 10:00:00\n")
+    old = os.stat(store.lock_path()).st_mtime - core.LOCK_STALE - 5
+    os.utime(store.lock_path(), (old, old))
+    store.add(eq("B", "10.0.0.2"))
+    assert [x.name for x in store.load()] == ["A", "B"]
+    folder = os.path.dirname(store.path)
+    assert not [n for n in os.listdir(folder) if n.endswith((".lock", ".stale"))]
+
+
+def test_fresh_lock_is_not_broken_when_this_pc_clock_runs_ahead(store, monkeypatch):
+    # 이 PC 시계가 1분 빠르면 방금 잡은 잠금도 오래돼 보인다 - 서버 시각으로 재야 치우지 않는다
+    store.add(eq("A"))
+    with open(store.lock_path(), "w", encoding="utf-8") as f:
+        f.write("OTHER-PC\t123\tabc\t2026-11-24 10:00:00\n")
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + core.LOCK_STALE + 30)
+    monkeypatch.setattr(core, "LOCK_WAIT", 0.3)
+    store.sleep = lambda s: None
+    with pytest.raises(StoreError):
+        store.add(eq("B", "10.0.0.2"))
+    monkeypatch.undo()
+    assert core._read_token(store.lock_path()).startswith("OTHER-PC")
+    assert not [n for n in os.listdir(os.path.dirname(store.path)) if n.endswith(".now")]
+
+
+def test_stale_check_puts_back_a_lock_taken_meanwhile(store, monkeypatch):
+    # 오래됐다고 본 직후 다른 PC 가 그 잠금을 치우고 새로 잡았으면, 옮긴 것(새 잠금)을 되돌려 놓는다
+    lock = store.lock_path()
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("DEAD\t1\told\tx\n")
+    real = store._lock_age
+    calls = []
+
+    def age(path):
+        calls.append(path)
+        if len(calls) == 1:              # 오래됐다고 판단한 직후 다른 PC 가 바꿔 잡는다
+            with open(lock, "w", encoding="utf-8") as f:
+                f.write("NEW\t2\tfresh\tx\n")
+            return core.LOCK_STALE + 5
+        return real(path)
+
+    monkeypatch.setattr(store, "_lock_age", age)
+    assert store._break_stale(lock) is True
+    assert core._read_token(lock) == "NEW\t2\tfresh\tx"
+    assert not [n for n in os.listdir(os.path.dirname(lock)) if n.endswith(".stale")]
+
+
+def test_stale_lock_that_cannot_be_removed_times_out_instead_of_spinning(store, monkeypatch):
+    store.add(eq("A"))
+    with open(store.lock_path(), "w", encoding="utf-8") as f:
+        f.write("DEAD-PC\t1\tdead\t2026-11-24 10:00:00\n")
+    old = os.stat(store.lock_path()).st_mtime - core.LOCK_STALE - 5
+    os.utime(store.lock_path(), (old, old))
+    real_rename = os.rename
+
+    def no_rename(src, dst):
+        if src == store.lock_path():
+            raise PermissionError(13, "denied")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(core.os, "rename", no_rename)
+    monkeypatch.setattr(core, "LOCK_WAIT", 0.5)
+    t0 = time.monotonic()
+    with pytest.raises(StoreError):
+        store.add(eq("B", "10.0.0.2"))
+    assert time.monotonic() - t0 < 5
+
+
+def test_lost_lock_is_noticed_before_writing(store, monkeypatch):
+    store.add(eq("A"))
+    real_write = core.EquipmentStore._write
+
+    def steal_then_write(self, *a, **k):
+        with open(self.lock_path(), "w", encoding="utf-8") as f:   # 다른 PC 가 잘못 치우고 잡았다
+            f.write("THIEF\t9\tz\tx\n")
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(core.EquipmentStore, "_write", steal_then_write)
+    with pytest.raises(StoreError) as e:
+        store.add(eq("B", "10.0.0.2"))
+    assert "겹쳐" in str(e.value)
+    monkeypatch.undo()
+    assert [x.name for x in store.load()] == ["A"]
+    assert core._read_token(store.lock_path()).startswith("THIEF")   # 남의 잠금은 그대로
+    assert not [n for n in os.listdir(os.path.dirname(store.path)) if n.endswith(".tmp")]
+
+
+def test_release_keeps_lock_of_someone_else(store):
+    token = store._acquire()
+    with open(store.lock_path(), "w", encoding="utf-8") as f:
+        f.write("OTHER\t9\tzzz\tx\n")
+    store._release(token)
+    assert os.path.exists(store.lock_path())
+
+
+def test_lock_in_folder_that_does_not_exist_yet(tmp_path):
+    s = EquipmentStore(str(tmp_path / "a" / "b" / "equipment.json"))
+    s.add(eq("A"))
+    assert [x.name for x in s.load()] == ["A"]
+    assert not os.path.exists(s.lock_path())
+
+
+def test_lock_cannot_be_created_is_a_write_error(tmp_path, monkeypatch):
+    s = EquipmentStore(str(tmp_path / "equipment.json"))
+    real_open = os.open
+
+    def deny(path, *a, **k):
+        if str(path).endswith(".lock"):
+            raise OSError(5, "I/O error")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(core.os, "open", deny)
+    with pytest.raises(StoreError) as e:
+        s.add(eq("A"))
+    assert "저장할 수 없습니다" in str(e.value)
+
+
+def test_lock_permission_error_retries_then_reports(tmp_path, monkeypatch):
+    s = EquipmentStore(str(tmp_path / "equipment.json"))
+    s.sleep = lambda x: None
+    real_open = os.open
+    tries = []
+
+    def flaky(path, *a, **k):
+        if str(path).endswith(".lock") and len(tries) < 2:   # 막 지워지는 중인 잠금 (Windows)
+            tries.append(1)
+            raise PermissionError(13, "delete pending")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(core.os, "open", flaky)
+    s.add(eq("A"))
+    assert len(tries) == 2
+    tries.clear()
+    monkeypatch.setattr(core.os, "open", lambda p, *a, **k: (_ for _ in ()).throw(PermissionError(13, "no")))
+    with pytest.raises(StoreError):
+        s.add(eq("B", "10.0.0.2"))
+
+
+# ------------------------------------------------------------ 읽기 전용 ---
+
+def _chmod_works(path) -> bool:
+    """chmod 로 쓰기를 막을 수 있는 환경인지 (root 나 Windows 에서는 안 된다)."""
+    probe = os.path.join(path, "chmod_probe")
+    open(probe, "w").close()
+    os.chmod(probe, 0o444)
+    try:
+        with open(probe, "r+b"):
+            return False
+    except OSError:
+        return True
+    finally:
+        os.chmod(probe, 0o644)
+        os.remove(probe)
+
+
+def test_read_only_file_is_detected(store, tmp_path):
+    store.add(eq("A"))
+    store.load()
+    assert store.read_only is False and store.check_writable()
+    before = open(store.path, "rb").read()
+    mtime = os.stat(store.path).st_mtime
+    if not _chmod_works(str(tmp_path)):
+        pytest.skip("chmod 로 쓰기를 막을 수 없는 환경")
+    os.chmod(store.path, 0o444)
+    try:
+        assert [e.name for e in store.load()] == ["A"]
+        assert store.read_only is True and not store.check_writable()
+        assert open(store.path, "rb").read() == before and os.stat(store.path).st_mtime == mtime
+    finally:
+        os.chmod(store.path, 0o644)
+    assert store.check_writable() and store.read_only is False
+
+
+def test_read_only_folder_without_file(tmp_path):
+    folder = tmp_path / "ro"
+    folder.mkdir()
+    s = EquipmentStore(str(folder / "equipment.json"))
+    assert s.load() == [] and s.read_only is False
+    if not _chmod_works(str(tmp_path)):
+        pytest.skip("chmod 로 쓰기를 막을 수 없는 환경")
+    os.chmod(folder, 0o555)
+    try:
+        try:
+            with open(folder / "probe", "w"):
+                pass
+        except OSError:
+            pass
+        else:
+            os.remove(folder / "probe")
+            pytest.skip("폴더는 chmod 로 쓰기를 막을 수 없는 환경 (Windows)")
+        assert s.load() == [] and s.read_only is True
+        with pytest.raises(StoreError):
+            s.add(eq("A"))
+    finally:
+        os.chmod(folder, 0o755)
+    assert not os.listdir(folder)
+
+
+def test_sharing_violation_is_not_read_only(store, monkeypatch):
+    store.add(eq("A"))
+    real_open = open
+
+    def busy(path, mode="r", *a, **k):
+        if mode == "r+b":
+            err = PermissionError(13, "in use")
+            err.winerror = 32
+            raise err
+        return real_open(path, mode, *a, **k)
+
+    monkeypatch.setattr("builtins.open", busy)
+    assert store.check_writable() is True
+    monkeypatch.setattr("builtins.open", lambda p, mode="r", *a, **k: (_ for _ in ()).throw(PermissionError(13, "x"))
+                        if mode == "r+b" else real_open(p, mode, *a, **k))
+    assert store.check_writable() is False
+
+
+def test_missing_folder_is_not_read_only(tmp_path):
+    s = EquipmentStore(str(tmp_path / "none" / "equipment.json"))
+    assert s.check_writable() and not os.path.exists(tmp_path / "none")
+
+
+# ------------------------------------------------------------ 뷰어 찾기 ---
+
+def test_detect_viewer_prefers_ultravnc_then_given_type(monkeypatch):
+    installed = {core.VIEWERS["tightvnc"]["paths"][0], core.VIEWERS["ultravnc"]["paths"][1]}
+    monkeypatch.setattr(core.os.path, "isfile", lambda p: p in installed)
+    assert core.detect_viewer() == ("ultravnc", core.VIEWERS["ultravnc"]["paths"][1])
+    assert core.detect_viewer("tightvnc") == ("tightvnc", core.VIEWERS["tightvnc"]["paths"][0])
+    assert core.detect_viewer("realvnc")[0] == "ultravnc"      # 없는 종류를 원하면 순서대로
+    assert core.detect_viewer("custom")[0] == "ultravnc"
+    assert core.detect_viewer("nonsense")[0] == "ultravnc"
+    installed.clear()
+    assert core.detect_viewer() is None
+    assert list(core.VIEWERS)[0] == "tightvnc"                 # 설정 화면의 목록 순서는 그대로
+
+
+def test_new_ultravnc_folder_is_found(monkeypatch):
+    path = r"C:\Program Files\uvnc\UltraVNC\vncviewer.exe"
+    monkeypatch.setattr(core.os.path, "isfile", lambda p: p == path)
+    assert core.detect_viewer() == ("ultravnc", path)
 
 
 def test_export_with_passwords_round_trips_through_import(tmp_path):

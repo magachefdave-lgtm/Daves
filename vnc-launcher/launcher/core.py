@@ -4,6 +4,7 @@ from __future__ import annotations
 import configparser
 import csv
 import datetime
+import functools
 import hashlib
 import hmac
 import io
@@ -222,10 +223,52 @@ def share_path(eq: Equipment) -> str:
 # ------------------------------------------------------------ 목록 저장 ---
 
 FORMAT_VERSION = 1   # 설비 목록 파일 형식. 이보다 큰 파일은 읽기만 한다.
+LOCK_WAIT = 10.0     # 다른 PC 가 저장 중일 때 기다리는 최대 시간(초)
+LOCK_STALE = 30.0    # 이보다 오래된 저장 잠금 파일은 저장 도중 꺼진 PC 가 남긴 것으로 보고 치운다
+_SHARING_VIOLATION = (32, 33)   # Windows: 다른 프로그램이 마침 파일을 열고 있음 (권한 문제가 아니다)
 
 
 def _safe_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", text)[:40] or "pc"
+
+
+def _read_token(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.readline().strip()
+    except OSError:
+        return None
+
+
+def _rename_new(src: str, dst: str) -> None:
+    """dst 가 이미 있으면 실패하는 이름 바꾸기 (Windows 의 os.rename 은 원래 그렇다)."""
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.path.exists(dst):
+            raise FileExistsError(dst)
+        os.rename(src, dst)
+        return
+    os.remove(src)
+
+
+def _saving(method):
+    """설비 목록을 바꾸는 동작: 읽기부터 쓰기까지 저장 잠금을 잡고 한다 (여러 PC 가 동시에 저장해도 서로 덮지 않게)."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        token = self._acquire()
+        self._token = token
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._token = None
+            self._release(token)
+    return wrapper
 
 
 def _replace_retry(src: str, dst: str, tries: int = 5) -> None:
@@ -257,10 +300,205 @@ class EquipmentStore:
         self.extra: dict[str, dict] = {}   # 이 버전이 모르는 항목 (새 버전이 넣은 것) - 저장할 때 그대로 둔다
         self.extra_top: dict = {}
         self.newer_format = False      # 이 버전보다 새 형식의 파일 (저장하지 않는다)
+        self.read_only = False         # 이 계정에는 목록을 바꿀 권한이 없음 (관리자만 쓰도록 폴더 권한을 정한 경우)
         self.today = lambda: datetime.date.today().isoformat()   # 테스트에서 바꿔 끼운다
+        self.sleep = time.sleep
+        self._skew: float | None = None
+        self._token: str | None = None   # 지금 잡고 있는 저장 잠금
 
     def folder(self) -> str:
         return os.path.dirname(os.path.abspath(self.path))
+
+    def lock_path(self) -> str:
+        return self.path + ".lock"
+
+    # ------------------------------------------------------------ 저장 잠금 ---
+
+    def _cannot_save(self, e: OSError) -> StoreError:
+        if self.seen_file and not os.path.exists(self.path):
+            return StoreError(f"설비 목록 파일이 보이지 않아 저장하지 않았습니다.\n{self.path}\n\n"
+                              "공유 폴더라면 네트워크 연결을 확인한 뒤 다시 시도하세요.")
+        return StoreError(
+            f"설비 목록 파일에 저장할 수 없습니다.\n{self.path}\n\n"
+            f"폴더 쓰기 권한이 있는지, 공유 폴더라면 연결되어 있는지 확인하세요.\n({e})")
+
+    def _acquire(self) -> str:
+        """저장 잠금 파일을 만든다. 다른 PC 가 잡고 있으면 LOCK_WAIT 초까지 기다린다."""
+        lock = self.lock_path()
+        token = "\t".join((socket.gethostname(), str(os.getpid()), uuid.uuid4().hex,
+                           datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        deadline = time.monotonic() + LOCK_WAIT
+        self._skew = None    # 이 PC 시계와 파일 서버 시계의 차이 (기다려야 할 때 한 번 잰다)
+        made_folder = False
+        denied = 0
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                pass
+            except FileNotFoundError as e:
+                if made_folder:
+                    raise self._cannot_save(e) from e
+                made_folder = True
+                try:
+                    os.makedirs(self.folder(), exist_ok=True)
+                except OSError as e2:
+                    raise self._cannot_save(e2) from e2
+                continue
+            except PermissionError as e:
+                # Windows 는 막 지워지는 중인 파일을 새로 만들 때도 권한 오류를 낸다 - 잠깐 다시 해 본다
+                denied += 1
+                if denied > 10 or (denied > 3 and not os.path.exists(lock)):
+                    raise self._cannot_save(e) from e
+                self.sleep(0.05)
+                continue
+            except OSError as e:
+                raise self._cannot_save(e) from e
+            else:
+                try:
+                    os.write(fd, (token + "\n").encode("utf-8"))
+                except OSError as e:
+                    os.close(fd)
+                    try:
+                        os.remove(lock)
+                    except OSError:
+                        pass
+                    raise self._cannot_save(e) from e
+                os.close(fd)
+                return token
+            if self._break_stale(lock):
+                continue
+            if time.monotonic() >= deadline:
+                holder = _read_token(lock) or ""
+                parts = holder.split("\t")
+                who = f"\n(저장 중인 PC: {parts[0]}, {parts[3]})" if len(parts) >= 4 else ""
+                raise StoreError("다른 PC가 설비 목록을 저장하고 있습니다. 잠시 뒤 다시 시도하세요.\n"
+                                 f"{self.path}{who}")
+            self.sleep(0.1)
+
+    def _server_skew(self) -> float:
+        """파일 서버 시계 - 이 PC 시계 (초). 잠금 파일의 시각은 서버 시계로 찍히므로, PC 시계가
+        틀려 있어도 오래된 잠금을 바르게 가리도록 같은 폴더에 작은 파일을 만들어 서버 시각을 잰다."""
+        if self._skew is None:
+            probe = f"{self.lock_path()}.{_safe_name(socket.gethostname())}-{os.getpid()}.now"
+            self._skew = 0.0
+            try:
+                fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+                try:
+                    os.write(fd, b"now")
+                finally:
+                    os.close(fd)
+                self._skew = os.stat(probe).st_mtime - time.time()
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.remove(probe)
+                except OSError:
+                    pass
+        return self._skew
+
+    def _lock_age(self, path: str) -> float:
+        """잠금 파일이 만들어진 뒤 지난 시간(초, 파일 서버 시계로). 파일이 없으면 FileNotFoundError."""
+        return time.time() + self._server_skew() - os.stat(path).st_mtime
+
+    def _break_stale(self, lock: str) -> bool:
+        """저장 도중 꺼진 PC 가 남긴 잠금이면 치운다. True = 바로 다시 잡아 본다.
+        False = 기다린다 (아직 살아 있는 잠금이거나, 치울 수 없는 잠금 - 기다리는 시간 제한에 맡긴다)."""
+        try:
+            if self._lock_age(lock) < LOCK_STALE:
+                return False
+        except FileNotFoundError:
+            return True        # 그사이 풀렸다
+        except OSError:
+            return False
+        aside = f"{lock}.{_safe_name(socket.gethostname())}-{os.getpid()}-{uuid.uuid4().hex[:8]}.stale"
+        try:
+            os.rename(lock, aside)
+        except FileNotFoundError:
+            return True        # 다른 PC 가 먼저 치웠다
+        except OSError:
+            return False       # 지울 권한이 없거나 누가 열고 있다 - 계속 두드리지 않고 기다린다
+        try:
+            fresh = self._lock_age(aside) < LOCK_STALE   # 이름을 바꿔도 시각은 그대로다
+        except OSError:
+            fresh = False
+        if fresh:
+            # 오래된 것을 보고 옮기는 사이 다른 PC 가 새로 잡은 잠금을 옮겼다 - 자리가 비어 있으면 되돌린다.
+            # 그 자리도 이미 다른 PC 가 잡았으면 옮긴 것은 그대로 둔다 (지우지 않는다 - 주인이 저장 직전에 알아챈다).
+            try:
+                _rename_new(aside, lock)
+            except OSError:
+                pass
+            return True
+        try:
+            os.remove(aside)
+        except OSError:
+            pass
+        return True
+
+    def _holds(self, token: str) -> bool:
+        """이 잠금을 아직 갖고 있는지 (드물게 다른 PC 가 오래된 것으로 잘못 보고 치웠을 수 있다)."""
+        for i in range(3):
+            got = _read_token(self.lock_path())
+            if got is not None:
+                return got == token
+            if not os.path.exists(self.lock_path()):
+                return False
+            self.sleep(0.05 * (i + 1))   # 다른 PC 가 마침 열고 있다
+        return True                       # 읽지 못했을 뿐 - 잃었다고 단정하지 않는다
+
+    def _release(self, token: str) -> None:
+        lock = self.lock_path()
+        for i in range(6):   # Windows: 다른 PC·백신이 마침 열고 있으면 지우기를 거절한다 - 잠깐씩 다시
+            got = _read_token(lock)
+            if got is None and not os.path.exists(lock):
+                return
+            if got is not None and got != token:
+                return       # 남의 잠금 (내 것은 이미 치워졌다)
+            if got == token:
+                try:
+                    os.remove(lock)
+                    return
+                except FileNotFoundError:
+                    return
+                except OSError:
+                    pass
+            self.sleep(0.05 * (i + 1))
+
+    # ------------------------------------------------------------ 쓰기 권한 ---
+
+    def _probe_writable(self) -> bool:
+        """이 계정이 목록을 바꿀 수 있는지. 파일 내용은 건드리지 않는다."""
+        try:
+            with open(self.path, "r+b"):
+                pass
+            return True
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return getattr(e, "winerror", None) in _SHARING_VIOLATION   # 다른 프로그램이 열고 있을 뿐
+        folder = self.folder()
+        if not os.path.isdir(folder):
+            return True        # 폴더도 아직 없다 - 처음 저장할 때 만든다 (안 되면 그때 알린다)
+        probe = os.path.join(folder, f".write_test_{_safe_name(socket.gethostname())}-{os.getpid()}")
+        try:
+            with open(probe, "w"):
+                pass
+        except OSError:
+            return False
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+        return True
+
+    def check_writable(self) -> bool:
+        try:
+            self.read_only = not self._probe_writable()
+        except Exception:
+            self.read_only = False
+        return not self.read_only
 
     def backup_dir(self) -> str:
         return os.path.join(self.folder(), "backup")
@@ -291,6 +529,7 @@ class EquipmentStore:
                     f"설비 목록 파일이 보이지 않습니다.\n{self.path}\n\n"
                     "공유 폴더라면 네트워크 연결을 확인하세요. 목록이 지워지지 않도록 지금은 저장하지 않습니다.")
             self.groups, self.lock = [], None
+            self.check_writable()
             return []
         try:
             with open(self.path, "r", encoding="utf-8-sig") as f:
@@ -307,6 +546,7 @@ class EquipmentStore:
             self.groups = self._merge_groups(data.get("groups") or [], items)
             self.lock = _valid_lock(data.get("lock"))
             self.seen_file = True
+            self.check_writable()
             return items
         except OSError as e:
             raise StoreError(
@@ -366,6 +606,10 @@ class EquipmentStore:
                 json.dump(data, f, ensure_ascii=False, indent=1)
                 f.flush()
                 os.fsync(f.fileno())
+            if self._token and not self._holds(self._token):
+                os.remove(tmp)
+                raise StoreError("다른 PC와 저장이 겹쳐 이번 변경은 저장하지 않았습니다. 다시 시도하세요.\n"
+                                 f"{self.path}")
             _replace_retry(tmp, self.path)
             self.groups, self.lock = groups, lock
             self.seen_file = True
@@ -388,12 +632,14 @@ class EquipmentStore:
         if errors:
             raise StoreError("\n".join(errors))
 
+    @_saving
     def add(self, eq: Equipment) -> None:
         items = self.load()
         self._check(eq, items)
         items.append(eq)
         self._write(items)
 
+    @_saving
     def update(self, eq: Equipment, base: Equipment | None = None) -> None:
         """설비를 고친다. base(고치기 시작할 때의 내용)를 주면 실제로 바꾼 항목만 반영한다.
 
@@ -414,6 +660,7 @@ class EquipmentStore:
         items[items.index(cur)] = new
         self._write(items)
 
+    @_saving
     def move(self, ids, group: str) -> int:
         """설비를 다른 그룹으로 옮긴다. 없는 그룹이면 새로 만든다. ("" = 그룹 없음)"""
         ids, group = set(ids), group.strip()
@@ -427,6 +674,7 @@ class EquipmentStore:
             self._write(items, self.groups + [group])
         return moved
 
+    @_saving
     def apply_groups(self, groups: list[str], assign: dict[str, str]) -> None:
         """그룹 관리 화면의 결과를 저장한다.
 
@@ -441,6 +689,7 @@ class EquipmentStore:
                 e.group = g if g in groups else ""
         self._write(items, groups)
 
+    @_saving
     def set_fields(self, ids, **fields) -> int:
         """여러 설비의 같은 항목을 한꺼번에 바꾼다 (주의 표시, 버튼 표시). 바뀐 설비 수를 돌려준다.
 
@@ -461,6 +710,7 @@ class EquipmentStore:
             self._write(items)
         return changed
 
+    @_saving
     def merge(self, items: list[dict], groups: list[str]) -> tuple[int, int]:
         """배포본의 설비 목록을 합친다: 같은 id 는 배포본 내용으로, 없는 것은 추가. (추가 수, 수정 수)
 
@@ -485,11 +735,13 @@ class EquipmentStore:
             self._write(mine, self.groups + [g for g in groups if g not in self.groups])
         return added, updated
 
+    @_saving
     def set_lock(self, pin: str | None) -> None:
         """편집 잠금 PIN 을 정한다. None 이면 잠금을 없앤다."""
         items = self.load()
         self._write(items, lock=make_lock(pin) if pin else None)
 
+    @_saving
     def delete(self, ids) -> int:
         ids = set(ids)
         items = self.load()
@@ -498,6 +750,7 @@ class EquipmentStore:
             self._write(kept)
         return len(items) - len(kept)
 
+    @_saving
     def import_csv(self, csv_path: str) -> tuple[int, int, list[str], dict[str, str]]:
         """설비명이 같으면 고치고 없으면 추가한다.
 
@@ -659,10 +912,15 @@ VIEWERS = {
 }
 
 
-def detect_viewer() -> tuple[str, str] | None:
-    """설치된 뷰어를 찾아 (종류, 경로)를 돌려준다."""
-    for key, v in VIEWERS.items():
-        for p in v["paths"]:
+# 여러 뷰어가 깔린 PC 에서 고르는 순서 (부서 PC 는 주로 UltraVNC). 화면의 뷰어 목록 순서는 VIEWERS 를 따른다.
+DETECT_ORDER = ("ultravnc", "tightvnc", "tigervnc", "realvnc")
+
+
+def detect_viewer(prefer: str | None = None) -> tuple[str, str] | None:
+    """설치된 뷰어를 찾아 (종류, 경로)를 돌려준다. prefer 종류가 깔려 있으면 그것을 먼저 고른다."""
+    order = ([prefer] if prefer in VIEWERS else []) + [k for k in DETECT_ORDER if k != prefer]
+    for key in order:
+        for p in VIEWERS[key]["paths"]:
             if os.path.isfile(p):
                 return key, p
     return None
