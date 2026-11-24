@@ -89,9 +89,11 @@ jobs:
         run: |
           # UltraVNC (Chocolatey 패키지 = 공식 설치 파일을 조용히 설치). 설치 기록을 그대로 남긴다.
           choco install ultravnc -y --no-progress --ignore-checksums 2>&1 | Write-Host
-          $dir = Join-Path $env:RUNNER_TEMP 'uvnc'
+          # 프로그램이 방금 깐 UltraVNC 뷰어를 저절로 찾는지 (처음 설정·배포본에서 쓰는 것)
+          python -c "from launcher.core import detect_viewer; f = detect_viewer(); print('뷰어 찾기:', f); assert f and f[0] == 'ultravnc', f"
+          if ($LASTEXITCODE) { throw "UltraVNC 뷰어를 찾지 못함" }
           $rel = [pscustomobject]@{ tag_name = 'chocolatey' }
-          $all = Get-ChildItem 'C:\Program Files\uvnc bvba', 'C:\Program Files\UltraVNC', 'C:\Program Files (x86)\uvnc bvba', 'C:\Program Files (x86)\UltraVNC', 'C:\ProgramData\chocolatey\lib\ultravnc' -Recurse -Filter winvnc.exe -ErrorAction SilentlyContinue
+          $all = Get-ChildItem 'C:\Program Files\uvnc\UltraVNC', 'C:\Program Files\uvnc bvba\UltraVNC', 'C:\Program Files\UltraVNC' -Filter winvnc.exe -ErrorAction SilentlyContinue
           $exe = ($all | Where-Object { $_.FullName -match 'x64|64' } | Select-Object -First 1)
           if (-not $exe) { $exe = $all | Select-Object -First 1 }
           if (-not $exe) { throw "winvnc.exe 를 찾지 못함" }

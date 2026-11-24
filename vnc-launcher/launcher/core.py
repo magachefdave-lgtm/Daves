@@ -632,7 +632,9 @@ VIEWERS = {
         "args": "-connect {host}::{port}",
         "pw": "-password {password}",
         "quiet": "-nostatus",
-        "paths": [p + r"\uvnc bvba\UltraVNC\vncviewer.exe" for p in _PF],
+        # 1.8 이후 설치 프로그램은 uvnc\UltraVNC, 그 전은 uvnc bvba\UltraVNC 에 깐다
+        "paths": [p + sub for sub in (r"\uvnc\UltraVNC\vncviewer.exe", r"\uvnc bvba\UltraVNC\vncviewer.exe",
+                                     r"\UltraVNC\vncviewer.exe") for p in _PF],
     },
     "realvnc": {
         "label": "RealVNC Viewer",
