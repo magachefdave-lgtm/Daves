@@ -87,10 +87,14 @@ jobs:
           "| 서버 | 설비 OS / 확인 방식 | 확인 횟수 | 응답 | 그 뒤 로그인 | 내용 | 판정 |" >> $env:GITHUB_STEP_SUMMARY
           "|---|---|---|---|---|---|---|" >> $env:GITHUB_STEP_SUMMARY
       - name: UltraVNC server
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           # UltraVNC (Chocolatey 패키지 = 공식 설치 파일을 조용히 설치). 설치 기록을 그대로 남긴다.
-          choco install ultravnc -y --no-progress --ignore-checksums 2>&1 | Write-Host
+          for ($i = 1; $i -le 4; $i++) {
+            choco install ultravnc -y --no-progress --ignore-checksums 2>&1 | Write-Host
+            if (Test-Path 'C:\Program Files\uvnc\UltraVNC\winvnc.exe') { break }
+            Write-Host "UltraVNC 설치 재시도 ($i) - 패키지 서버 응답 없음"; Start-Sleep -Seconds 60
+          }
           # 프로그램이 방금 깐 UltraVNC 뷰어를 저절로 찾는지 (처음 설정·배포본에서 쓰는 것)
           python -c "from launcher.core import detect_viewer; f = detect_viewer(); print('뷰어 찾기:', f); assert f and f[0] == 'ultravnc', f"
           if ($LASTEXITCODE) { throw "UltraVNC 뷰어를 찾지 못함" }
@@ -158,12 +162,12 @@ jobs:
           exit $rc
       - name: TightVNC server
         if: always()
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           for ($i = 1; $i -le 3; $i++) {
           choco install tightvnc -y --no-progress --install-arguments="'ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=ci-pw-01 SET_RFBPORT=1 VALUE_OF_RFBPORT=5901 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1'" | Select-Object -Last 8
             if (Get-Service tvnserver -ErrorAction SilentlyContinue) { break }
-            Write-Host "TightVNC 설치 재시도 ($i)"; Start-Sleep -Seconds 20
+            Write-Host "TightVNC 설치 재시도 ($i)"; Start-Sleep -Seconds 60
           }
           Restart-Service tvnserver -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
