@@ -72,6 +72,9 @@
     if (embedded || !state.data) return;
     fetch('/api/status', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
       if (s.revision !== state.revision) reload();
+      else if (!state.data.meta.as_of && R.dayNumber(new Date()) !== state.today && !state.editing) {
+        state.today = R.dayNumber(new Date()); recompute(); // 밤새 켜 둔 화면: 날짜가 바뀌면 경과일 다시 계산
+      }
       else if (s.error !== state.data.meta.error) { state.data.meta.error = s.error; renderTop(); }
     }).catch(function () { showError('서버와 연결이 끊겼습니다. 서버 PC 를 확인하세요. 화면은 마지막 데이터입니다.'); });
   }
@@ -234,7 +237,7 @@
   function ovenMap(e) {
     var occ = e.occupied || {};
     var nums = Object.keys(occ).map(Number);
-    var n = Math.max(e.capacity || 0, nums.length ? Math.max.apply(null, nums) : 0);
+    var n = Math.min(R.OVEN_MAX, Math.max(e.capacity || 0, nums.length ? Math.max.apply(null, nums) : 0));
     if (!n) return '';
     var cells = '';
     for (var i = 1; i <= n; i++) {
@@ -518,18 +521,26 @@
     if (state.editing) return;
     var key = td.getAttribute('data-key'), f = td.getAttribute('data-f');
     var r = findRec(key); if (!r) return;
-    var isDate = R.DATE_FIELDS.indexOf(f) >= 0;
+    if (state.saving) { toast('저장 중입니다. 끝난 뒤 다시 입력하세요.', true); return; }
+    var orig = r[f] || '';
+    // 날짜 칸: 2026/11/27 같은 값은 맞춰서 날짜 입력으로, 읽을 수 없는 값은 지워지지 않게 글자 입력으로
+    var isDate = false, start = orig;
+    if (R.DATE_FIELDS.indexOf(f) >= 0) {
+      try { start = cleanDate(orig, f); isDate = true; } catch (e) { start = orig; }
+    }
     state.editing = { key: key, field: f };
     td.classList.add('editing');
     td.innerHTML = '<input class="cellin" type="' + (isDate ? 'date' : 'text') + '" maxlength="200" aria-label="' + esc(f) + '">';
     var inp = td.firstChild;
-    inp.value = r[f] || '';
+    inp.value = start;
+    var initial = inp.value;
     inp.focus(); if (!isDate) inp.select();
     var done = false;
     function finish(keep) {
       if (done) return; done = true;
       state.editing = null;
-      if (keep) setCell(r, f, inp.value);
+      // 손대지 않고 나가면 아무것도 바꾸지 않는다
+      if (keep && inp.value !== initial) setCell(r, f, inp.value);
       if (state.pendingReload) { state.pendingReload = false; reload(); } else renderView();
     }
     inp.addEventListener('keydown', function (e) {
@@ -553,7 +564,13 @@
   }
 
   // ---------- 행 추가 · 삭제 · 되살리기 ----------
+  function busy() {
+    if (!state.saving) return false;
+    toast('저장 중입니다. 끝난 뒤 다시 하세요.', true);
+    return true;
+  }
   function toggleDelete(key) {
+    if (busy()) return;
     var r = findRec(key); if (!r) return;
     var P = state.pending;
     if (r._padd) { P.add.splice(r._pi, 1); toast('추가 예정이던 행을 뺐습니다.'); return changed(); }
@@ -563,6 +580,7 @@
     changed();
   }
   function toggleRestore(key) {
+    if (busy()) return;
     var P = state.pending;
     if (P.restore[key]) delete P.restore[key]; else P.restore[key] = true;
     changed();
@@ -575,6 +593,7 @@
     { k: 'Structure', ph: '여러 개는 | 로 구분', wide: 1 }, { k: '비고', wide: 1 }
   ];
   function openAdd() {
+    if (busy()) return;
     var m = $('modal');
     var lists = {};
     var fields = ADD_FIELDS.map(function (d) {
@@ -700,6 +719,7 @@
     if (ref) $('e-drop').onclick = function () { m.hidden = true; dropRef(ref); savePending(); recompute(); save(); };
   }
   function discard() {
+    if (busy()) return;
     var n = pendCount();
     if (!n || !window.confirm('저장하지 않은 변경 ' + n + '건을 모두 취소할까요?')) return;
     state.pending = emptyPending(); changed();

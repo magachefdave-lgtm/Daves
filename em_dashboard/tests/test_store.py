@@ -238,5 +238,18 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(all(l.count(",") == 16 for l in lines if l))  # 내보내기는 원본과 같은 17컬럼
         self.assertNotIn("MO-0", S.to_txt(vis, []))
 
+    def test_key_change_does_not_attach_skipped_records_to_other_rows(self):
+        # Test,List_no -> Test,Lot_ID : List 1 은 새 키(EM|A)가 겹쳐 못 옮김. 그 옛 키 EM|1 은 List 2 의 새 키와 같다
+        src = [row(List_no="1", Lot_ID="A"), row(List_no="2", Lot_ID="1"), row(List_no="3", Lot_ID="A")]
+        self.s.remap_keys(src)
+        self.s.apply_batch([{"op": "set", "key": "EM|1", "field": "Sdm_no", "value": "S1", "version": 0},
+                            {"op": "delete", "key": "EM|1"}], "A", "ip", src)
+        S.set_key_fields(["Test", "Lot_ID"])
+        self.assertEqual(self.s.remap_keys(src), (0, 1))
+        vis, gone = S.merge(src, *self.s.snapshot())
+        self.assertEqual(gone, [])
+        self.assertEqual([r["Sdm_no"] for r in vis if r["List_no"] == "2"], [""])
+        self.assertIsNone(self.s.remap_keys(src))
+
 if __name__ == "__main__":
     unittest.main()

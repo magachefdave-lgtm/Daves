@@ -84,6 +84,7 @@
     return m ? +m[1] : null;
   }
 
+  var OVEN_MAX = 99; // 설비당 Oven 은 24대 이하. 잘못 붙여 넣은 큰 번호를 막는 상한
   // Oven(DUT) 번호 칸 해석: "1|2|3", "1-8", "1~4|7", "1 2 3" -> [1,2,3...] (정렬, 중복 제거)
   // 비었으면 [], 읽을 수 없는 조각이 있으면 null
   function ovenNumbers(v) {
@@ -94,7 +95,7 @@
       var m = /^(?:#|no\.?)?(\d+)(?:\s*[-~]\s*(\d+))?$/i.exec(t);
       if (!m) { ok = false; return; }
       var a = +m[1], b = m[2] !== undefined ? +m[2] : a;
-      if (b < a || b - a > 99) { ok = false; return; }
+      if (a < 1 || b < a || b > OVEN_MAX) { ok = false; return; }
       for (var i = a; i <= b; i++) out[i] = 1;
     });
     if (!ok) return null;
@@ -220,7 +221,7 @@
     STAGES: STAGES, DATE_FIELDS: DATE_FIELDS, BOARD_DUT: BOARD_DUT,
     has: has, parseDate: parseDate, dayNumber: dayNumber, stageOf: stageOf, stageSince: stageSince,
     agingDays: agingDays, isOverdue: isOverdue, boardsOf: boardsOf, flagsOf: flagsOf,
-    analyze: analyze, keyOf: keyOf, ovenNumbers: ovenNumbers, summarize: summarize, equipmentLoad: equipmentLoad
+    analyze: analyze, keyOf: keyOf, ovenNumbers: ovenNumbers, OVEN_MAX: OVEN_MAX, summarize: summarize, equipmentLoad: equipmentLoad
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.EMRules = api;

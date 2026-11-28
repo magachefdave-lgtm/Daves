@@ -153,9 +153,9 @@ def make_handler(cfg, cache, store):
     def revision():
         return "%d.%d" % (cache.revision, store.counter)
 
-    def merged():
+    def merged(rows=None):
         edits, added, deleted = store.snapshot()
-        return store_mod.merge(cache.data["rows"], edits, added, deleted)
+        return store_mod.merge(cache.data["rows"] if rows is None else rows, edits, added, deleted)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "EMDashboard/" + APP_VERSION
@@ -189,13 +189,16 @@ def make_handler(cfg, cache, store):
                 return self._json(dict(cache.status(), revision=revision()))
             if path == "/api/data":
                 cache.refresh(min_interval=0)
+                # revision 을 데이터보다 먼저 잡는다. 그 사이 다른 PC 가 저장하면 화면은 다음 확인 때
+                # 다른 revision 을 보고 다시 읽는다 (반대 순서면 바뀐 내용을 놓칠 수 있음)
+                rev, status = revision(), cache.status()
                 d = cache.data
-                visible, gone = merged()
+                visible, gone = merged(d["rows"])
                 return self._json({
                     "rows": visible,
                     "deleted": gone,
                     "quarantine": d["quarantine"],
-                    "meta": dict(cache.status(), revision=revision(), source=cfg["em_txt"], encoding=d["encoding"],
+                    "meta": dict(status, revision=rev, source=cfg["em_txt"], encoding=d["encoding"],
                                  size=d["size"], sha256=d["sha256"], version=APP_VERSION, demo=False),
                     "config": {"poll_seconds": cfg["poll_seconds"], "editable": store_mod.EDITABLE,
                                "key_fields": cfg["key_fields"], "ovens": cfg["ovens"]},

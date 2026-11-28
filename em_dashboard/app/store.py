@@ -352,6 +352,7 @@ class Store:
         """
         new = ",".join(KEY_FIELDS)
         TMP = "~remap~"
+        ORPHAN = "~unmapped~"
         with self.lock:
             row = self.conn.execute("SELECT value FROM meta WHERE name='key_fields'").fetchone()
             if row is None or row[0] == new:
@@ -369,8 +370,14 @@ class Store:
             stored = set()
             for t in ("edits", "deleted", "added"):
                 stored.update(k for (k,) in self.conn.execute("SELECT DISTINCT row_key FROM %s" % t))
+            stored = {k for k in stored if not k.startswith(ORPHAN)}  # 예전에 떼어 둔 기록은 그대로
             moved = [k for k in stored if k in mapping]
+            orphan = [k for k in stored if k not in mapping]
             try:
+                # 못 옮긴 기록은 새 기준의 다른 행에 잘못 붙지 않게 따로 떼어 둔다 (지우지 않음)
+                for k in orphan:
+                    for t in ("edits", "deleted", "added", "history"):
+                        self.conn.execute("UPDATE %s SET row_key=? WHERE row_key=?" % t, (ORPHAN + row[0] + "~" + k, k))
                 # 새 키가 다른 옛 키와 겹칠 수 있어 임시 이름을 거쳐 두 번에 옮긴다
                 for k in moved:
                     for t in ("edits", "deleted", "added", "history"):

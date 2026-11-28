@@ -140,6 +140,9 @@ eq(R.ovenNumbers('3~1'), null, 'Oven 거꾸로 범위는 형식 오류');
 eq(R.ovenNumbers('8 7 7'), [7, 8], 'Oven 공백 구분, 중복 제거');
 eq(R.ovenNumbers('A1'), null, 'Oven 숫자 아님');
 eq(R.ovenNumbers('.'), [], 'Oven 빈 값');
+eq(R.ovenNumbers('1000000000'), null, 'Oven 큰 번호는 형식 오류');
+eq(R.ovenNumbers('0'), null, 'Oven 0번 없음');
+eq(R.ovenNumbers('99'), [99], 'Oven 상한 99');
 var ovr = R.analyze([
   row({ List_no: '1', '설비': 'MO-01', Oven: '1-4', DUT: '4/4', PKG_in: '2026-11-01', Test_in: '2026-11-02' }),
   row({ List_no: '2', '설비': 'MO-01', Oven: '4|5', DUT: '4/8', PKG_in: '2026-11-01', Test_in: '2026-11-02' }),
